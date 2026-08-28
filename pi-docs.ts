@@ -18,6 +18,20 @@ const FIRST_BULLET_PREFIX = "- Main documentation: ";
 /** Positive bound on the bullet run: pi's block has 7; a longer run means the anchors drifted. */
 const MAX_BLOCK_BULLETS = 32;
 
+function findPiDocsBulletRunEnd(lines: readonly string[]): number | undefined {
+	let index = 1; // lines[0] is the header itself
+	if (lines[index] === "") index += 1;
+	if (!lines[index]?.startsWith(FIRST_BULLET_PREFIX)) return undefined;
+
+	let bullets = 0;
+	while (lines[index]?.startsWith("- ")) {
+		if (bullets === MAX_BLOCK_BULLETS) return undefined;
+		bullets += 1;
+		index += 1;
+	}
+	return index;
+}
+
 /**
  * Detects pi's built-in documentation block and removes it from the prompt.
  * Structural, not verbatim: anchors on the header line and the first bullet
@@ -31,17 +45,10 @@ export function stripPiDocsBlock(systemPrompt: string): { prompt: string; block:
 
 	const blockStart = start + BLOCK_START_ANCHOR.length - BLOCK_HEADER.length;
 	const lines = systemPrompt.slice(blockStart).split("\n");
-	let index = 1; // lines[0] is the header itself
-	if (lines[index] === "") index += 1;
-	if (!lines[index]?.startsWith(FIRST_BULLET_PREFIX)) return undefined;
-	let bullets = 0;
-	while (index < lines.length && lines[index].startsWith("- ")) {
-		bullets += 1;
-		if (bullets > MAX_BLOCK_BULLETS) return undefined;
-		index += 1;
-	}
+	const end = findPiDocsBulletRunEnd(lines);
+	if (end === undefined) return undefined;
 
-	const consumed = lines.slice(0, index).reduce((length, line) => length + line.length + 1, 0);
+	const consumed = lines.slice(0, end).reduce((length, line) => length + line.length + 1, 0);
 	const block = systemPrompt.slice(blockStart, blockStart + consumed).replace(/\n$/, "");
 	const tail = systemPrompt.slice(blockStart + consumed).replace(/^\n/, "");
 	return { prompt: `${systemPrompt.slice(0, start)}\n\n${tail}`, block };
@@ -69,6 +76,7 @@ export function piDocsSkillDirPath(agentDir: string): string {
 	return join(agentDir, "cache", "pi-better-skills", PI_DOCS_SKILL_NAME);
 }
 
+/** Return the generated pi-docs skill file path for an agent directory. */
 export function piDocsSkillFilePath(agentDir: string): string {
 	return join(piDocsSkillDirPath(agentDir), "SKILL.md");
 }
@@ -110,13 +118,7 @@ export function piDocsFeatureEnabled(env: Record<string, string | undefined> = p
 	return false;
 }
 
-/**
- * The single gate for the whole feature, called at resources_discover time:
- * register the skill only when the toggle is on AND the block was detected in
- * this session's prompt. When pi's prompt drifts past the anchors, the skill
- * simply does not load and the session stays stock pi — no redundancy, no
- * stale content served. agentDir is injectable for tests.
- */
+/** The block captured during the current discovery pass. */
 let lastCapturedPiDocsBlock: string | undefined;
 
 /** Same flag pi core uses; extension skillPaths bypass it, so we honor it ourselves. */
@@ -128,11 +130,17 @@ export function hasNoSkillsFlag(argv: readonly string[] = process.argv): boolean
 	return false;
 }
 
+/**
+ * Capture the current pi-docs block and expose its generated skill directory to pi.
+ * When pi's prompt drifts past the anchors, the skill is not registered and the
+ * session stays stock pi. `agentDir` is injectable for tests.
+ */
 export function piDocsSkillRegistration(
 	systemPrompt: string,
 	agentDir: string = getAgentDir(),
 	argv: readonly string[] = process.argv,
 ): { skillPaths: string[] } | undefined {
+	lastCapturedPiDocsBlock = undefined;
 	if (!piDocsFeatureEnabled()) return undefined;
 	if (hasNoSkillsFlag(argv)) return undefined;
 	const stripped = stripPiDocsBlock(systemPrompt);
@@ -174,19 +182,34 @@ export function applyPiDocsStrip(
 	options: PiDocsStripOptions = {},
 	agentDir: string = getAgentDir(),
 ): string | undefined {
-	if (process.env.PI_BETTER_SKILLS_DEBUG === "1") {
-		writeFileSync(`/tmp/pi-better-skills-pidocs-prompt-${process.pid}.txt`, systemPrompt);
-		piDocsDebug("dumped strip-time prompt", { skills: options.skills?.length, selectedTools: options.selectedTools });
-	}
+	debugPiDocsStrip(systemPrompt, options);
 	if (!piDocsFeatureEnabled()) return undefined;
 	const block = lastCapturedPiDocsBlock;
-	if (!block || !systemPrompt.includes(block)) return undefined;
-	const ourPath = piDocsSkillFilePath(agentDir);
-	const isLoadedAtOurPath = options.skills?.some((skill) => skill.filePath === ourPath) ?? false;
-	if (!isLoadedAtOurPath) {
+	if (!block) return undefined;
+	if (!systemPrompt.includes(block)) return undefined;
+	if (!hasLoadedPiDocsSkill(options, agentDir)) {
 		piDocsDebug("skill not loaded at our path, staying stock");
 		return undefined;
 	}
+	return stripCapturedPiDocsBlock(systemPrompt, block);
+}
+
+function debugPiDocsStrip(systemPrompt: string, options: PiDocsStripOptions): void {
+	if (process.env.PI_BETTER_SKILLS_DEBUG !== "1") return;
+	try {
+		writeFileSync(`/tmp/pi-better-skills-pidocs-prompt-${process.pid}.txt`, systemPrompt);
+		piDocsDebug("dumped strip-time prompt", { skills: options.skills?.length, selectedTools: options.selectedTools });
+	} catch {
+		// Diagnostics must never break the strip path.
+	}
+}
+
+function hasLoadedPiDocsSkill(options: PiDocsStripOptions, agentDir: string): boolean {
+	const ourPath = piDocsSkillFilePath(agentDir);
+	return Boolean(options.skills?.some((skill) => skill.filePath === ourPath));
+}
+
+function stripCapturedPiDocsBlock(systemPrompt: string, block: string): string | undefined {
 	const anchor = `\n\n${block}`;
 	const start = systemPrompt.indexOf(anchor);
 	if (start < 0) return undefined;
