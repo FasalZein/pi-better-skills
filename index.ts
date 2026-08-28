@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { SkillInvocationMessageComponent, stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer } from "@earendil-works/pi-tui";
+import { applyPiDocsStrip, piDocsSkillRegistration } from "./pi-docs";
 import {
 	extractDisableModelInvocation,
 	extractGlobs,
@@ -953,15 +954,23 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("resources_discover", async (_event, ctx) => {
 		refreshSkills(ctx.cwd, undefined, ctx.isProjectTrusted());
+		return piDocsSkillRegistration(ctx.getSystemPrompt());
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
 		refreshSkills(ctx.cwd, loaded, ctx.isProjectTrusted());
 
+		let basePrompt = event.systemPrompt;
+		const strippedPrompt = applyPiDocsStrip(basePrompt, {
+			skills: loaded,
+			selectedTools: event.systemPromptOptions?.selectedTools,
+		});
+		if (strippedPrompt !== undefined) basePrompt = strippedPrompt;
+
 		return {
 			systemPrompt:
-				event.systemPrompt +
+				basePrompt +
 				`\n\n<agent_skills>
   <path_policy>
     Relative file references in an active SKILL.md normally resolve from that skill's directory when they exist there.

@@ -77,6 +77,23 @@ Pi core keeps skills simple and asks the model to resolve relative paths itself.
 - `PI_SKILL_DIR` and `PI_WORKSPACE`
 - dynamic `SKILL.md` shell placeholders for trusted skills
 
+## Optional: trim pi's built-in docs prompt (`pi-docs`)
+
+Pi core injects a "Pi documentation" block (~280 tokens) into every system prompt, pointing the model at the installed package's README, `docs/`, and `examples/`. `pi-better-skills` can convert that block into a generated skill so its content loads on demand instead:
+
+- The block is stripped from the system prompt, and a `pi-docs` skill is registered whose body is inherited verbatim from the live block — it always matches the installed pi's wording and paths, on every OS and install location.
+- The skill file lives at `<agent-dir>/cache/pi-better-skills/pi-docs/SKILL.md`, outside pi's native skill roots, and is rewritten only when pi's block changes.
+- One gate: the strip happens only when the skill actually loaded at that path. If pi's prompt drifts past the structural anchors (header line and first bullet), the session falls back to completely stock behavior — no strip, no skill, nothing broken. Uninstalling the extension removes the feature and the file together.
+- A user's own `pi-docs` skill wins name collisions; the extension stands down.
+
+The feature is on by default. To opt out:
+
+```bash
+PI_BETTER_SKILLS_NO_PI_DOCS=1 pi   # or export it, or write it inline per command
+```
+
+`PI_BETTER_SKILLS_NO_PI_DOCS=1 pi ...` also works for one-off runs. Set `PI_BETTER_SKILLS_DEBUG=1` for maintainer diagnostics on stderr.
+
 ## When to use it
 
 Install this if you use skills that include any of the following:
