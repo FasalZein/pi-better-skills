@@ -271,7 +271,8 @@ function inlineSkillMessage(skill: InlineSkillDisplay): {
  */
 export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[]): string {
 	const blocks = skills.map((skill) => skill.block).join("\n\n");
-	return blocks ? `${blocks}\n\n${text}` : text;
+	if (!blocks) return text;
+	return text ? `${blocks}\n\n${text}` : blocks;
 }
 
 /**
@@ -285,6 +286,9 @@ export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[])
  * before the user's queued text arrives. Inline the blocks into the single
  * transformed text instead (no `[skill]` row, but skill + instruction stay
  * together). This is the seam the streaming regression turns on.
+ * With two or more blocks this concatenated shape is what it costs: core's
+ * parser renders only the first block as a skill row, the rest as user text.
+ * Accepted because splitting the message would reintroduce the regression.
  *
  * Exception: if the cleaned prompt still starts with a slash-command (e.g. a
  * leading prompt-template `/tmpl ...`), it must stay at position 0 so pi core's
@@ -293,22 +297,44 @@ export function inlineSkillsIntoText(text: string, skills: InlineSkillDisplay[])
  * rare template+skill combo we fall back to separate skill messages: the
  * template keeps expanding, and the skills may split across one-at-a-time drains
  * as they did before this fix.
+ *
+ * An empty prompt (a bare leading `/skill:name` invocation whose declaration was
+ * stripped) sends the earlier skills as `[skill]` rows and carries the last
+ * block as the user text itself: the message is never empty, and core's
+ * `parseSkillBlock` only parses one leading `<skill>` block per user message,
+ * so a single concatenated multi-block message would render the rest as raw
+ * XML user text.
  */
 export function planInlineSkillDelivery(
 	result: { text: string; skills: InlineSkillDisplay[] },
 	streaming: boolean,
 ): { text: string; messages: InlineSkillDisplay[] } {
-	if (streaming && !result.text.startsWith("/")) {
+	if (!result.text.startsWith("/") && streaming) {
 		return { text: inlineSkillsIntoText(result.text, result.skills), messages: [] };
+	}
+	if (!result.text.trim() && result.skills.length > 0) {
+		const [last] = result.skills.slice(-1);
+		return { text: last.block, messages: result.skills.slice(0, -1) };
 	}
 	return { text: result.text, messages: result.skills };
 }
 
-function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDisplay[]): boolean {
+/**
+ * Return whether pi core can handle this single leading skill command unchanged.
+ *
+ * @param text - The original user prompt.
+ * @param skills - The resolvable skills extracted from the prompt.
+ * @returns `true` only for core's exact single-leading-skill grammar.
+ */
+export function isOrdinarySingleLeadingSkillCommand(text: string, skills: InlineSkillDisplay[]): boolean {
 	if (skills.length !== 1) return false;
 	const token = `/skill:${skills[0].name}`;
-	const trimmed = text.trimStart();
-	return trimmed === token || (trimmed.startsWith(token) && /\s/.test(trimmed[token.length] ?? ""));
+	// Mirror core's `_expandSkillCommand` grammar exactly: it only expands text
+	// that literally starts with the token and ends there or continues with a
+	// space. Leading whitespace or any other prefix makes core pass the message
+	// through verbatim, so the extension must own those itself instead of
+	// deferring and letting the declaration reach the model.
+	return text === token || (text.startsWith(token) && text[token.length] === " ");
 }
 
 /**
@@ -339,13 +365,92 @@ export function commitRefExpansion(batch: InlineSkillDisplay[], deps: RefDeps, i
 	return out;
 }
 
+type InlineSkillMatch = {
+	match: RegExpMatchArray;
+	start: number;
+};
+
+type InlineSkillReplacement = {
+	start: number;
+	end: number;
+	name: string;
+};
+
+type ResolvedInlineSkillMatch = {
+	display: InlineSkillDisplay;
+	replacement: InlineSkillReplacement;
+};
+
+function findInlineSkillMatches(text: string): InlineSkillMatch[] {
+	return [...text.matchAll(INLINE_SKILL_TOKEN)]
+		.map((match) => ({ match, start: match.index ?? 0 }))
+		.filter(({ start }) => start === 0 || /\s/.test(text[start - 1] ?? ""));
+}
+
+/** Decide whether one resolved token is stripped or rendered as a bare name. */
+function makeInlineSkillReplacement(
+	text: string,
+	match: RegExpMatchArray,
+	start: number,
+	name: string,
+): InlineSkillReplacement {
+	const leading = text.slice(0, start).trim() === "";
+	const restTrimmed = text.slice(start + match[0].length).trimStart();
+	const keepBareName = restTrimmed.startsWith("/") && !restTrimmed.startsWith("/skill:");
+	return {
+		start,
+		end: start + match[0].length,
+		name: leading && !keepBareName ? "" : name,
+	};
+}
+
+function resolveInlineSkillMatch(
+	candidate: InlineSkillMatch,
+	resolve: (name: string) => InlineSkillRef | undefined,
+	readBody: (skill: InlineSkillRef) => string,
+	decorate: ((body: string, skill: InlineSkillRef) => string) | undefined,
+	includeLeading: boolean | undefined,
+	text: string,
+): ResolvedInlineSkillMatch | undefined {
+	const { match, start } = candidate;
+	if (start === 0 && !includeLeading) return undefined; // leading skill -> pi core expands ordinary single-skill prompts
+	const skill = resolve(match[1]);
+	if (!skill) return undefined; // unknown skill: leave token verbatim
+
+	let body: string;
+	try {
+		body = readBody(skill);
+	} catch {
+		return undefined; // unreadable SKILL.md: leave token verbatim
+	}
+
+	const inner = decorate ? decorate(body, skill) : body;
+	return {
+		display: formatInlineSkillDisplay(skill, inner),
+		replacement: makeInlineSkillReplacement(text, match, start, skill.name),
+	};
+}
+
+function replaceInlineSkillTokens(text: string, replacements: InlineSkillReplacement[]): string {
+	replacements.sort((a, b) => a.start - b.start);
+	let out = "";
+	let cursor = 0;
+	for (const { start, end, name } of replacements) {
+		out += text.slice(cursor, start) + name;
+		cursor = end;
+	}
+	return out + text.slice(cursor);
+}
+
 /**
- * Replace resolvable `/skill:<name>` tokens in user text with the bare skill
- * `name`, and return the referenced skills as separate skill-display records.
- * Leaving the bare name keeps the user's sentence readable (no gap) while the
- * skill body is rendered as its own `[skill]` row above the prompt. Replacing
- * (rather than keeping) the `/skill:` sigil also stops pi core from
- * double-expanding a leading token, since the text no longer starts with it.
+ * Replace resolvable `/skill:<name>` tokens in user text and return the
+ * referenced skills as separate skill-display records. A leading declaration is
+ * stripped entirely, matching pi core's own `/skill:name args` expansion (the
+ * skill rides in its own block, never in the sent text); every other token
+ * becomes the bare skill `name`, keeping the user's sentence readable (no gap)
+ * while the skill body is rendered as its own `[skill]` row above the prompt.
+ * Removing the `/skill:` sigil also stops pi core from double-expanding a
+ * leading token, since the text no longer starts with it.
  *
  * By default the leading token is skipped so pi core can keep handling ordinary
  * single-skill commands. Pass `includeLeading: true` when the extension owns the
@@ -364,46 +469,22 @@ export function extractInlineSkillDisplays(
 ): { text: string; skills: InlineSkillDisplay[] } | undefined {
 	if (!text.includes("/skill:")) return undefined;
 
-	const matches = [...text.matchAll(INLINE_SKILL_TOKEN)].filter((match) => {
-		const start = match.index ?? 0;
-		return start === 0 || /\s/.test(text[start - 1] ?? "");
-	});
+	const matches = findInlineSkillMatches(text);
 	if (matches.length === 0) return undefined;
 
-	type Replacement = { start: number; end: number; name: string };
-	const replacements: Replacement[] = [];
-	const skills: InlineSkillDisplay[] = [];
+	const resolved = matches.flatMap((candidate) => {
+		const result = resolveInlineSkillMatch(candidate, resolve, readBody, decorate, options?.includeLeading, text);
+		return result ? [result] : [];
+	});
+	if (resolved.length === 0) return undefined;
 
-	for (const match of matches) {
-		const start = match.index ?? 0;
-		if (start === 0 && !options?.includeLeading) continue; // leading skill -> pi core expands ordinary single-skill prompts
-		const skill = resolve(match[1] ?? "");
-		if (!skill) continue; // unknown skill: leave token verbatim
-
-		let body: string;
-		try {
-			body = readBody(skill);
-		} catch {
-			continue; // unreadable SKILL.md: leave token verbatim
-		}
-
-		const inner = decorate ? decorate(body, skill) : body;
-		skills.push(formatInlineSkillDisplay(skill, inner));
-		replacements.push({ start, end: start + match[0].length, name: skill.name });
-	}
-
-	if (replacements.length === 0) return undefined;
-
-	replacements.sort((a, b) => a.start - b.start);
-	let out = "";
-	let cursor = 0;
-	for (const { start, end, name } of replacements) {
-		out += text.slice(cursor, start) + name;
-		cursor = end;
-	}
-	out += text.slice(cursor);
-
-	return { text: out.trim(), skills };
+	return {
+		text: replaceInlineSkillTokens(
+			text,
+			resolved.map(({ replacement }) => replacement),
+		).trim(),
+		skills: resolved.map(({ display }) => display),
+	};
 }
 
 function scanSkillRoots(roots: string[]): SkillRecord[] {

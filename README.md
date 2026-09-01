@@ -131,7 +131,7 @@ You can mention multiple skills in one message:
 /skill:visual-explainer What's docs.lakebed.dev about? /skill:firecrawl
 ```
 
-For multi-skill messages, `pi-better-skills` handles the skill expansion itself: each resolvable skill appears as its own `[skill] <name>` conversation row before the cleaned user prompt, and the model receives the skill content before the question. Ordinary single leading `/skill:name` commands still fall through to Pi core.
+For multi-skill messages, `pi-better-skills` handles the skill expansion itself: each resolvable skill appears as its own `[skill] <name>` conversation row before the cleaned user prompt, and the model receives the skill content before the question. A leading `/skill:name` declaration is stripped from the sent prompt (like vanilla pi); skills mentioned later keep their bare name in the sentence. Ordinary single leading `/skill:name` commands still fall through to Pi core.
 
 After installing or editing the extension in an existing pi session, reload pi:
 

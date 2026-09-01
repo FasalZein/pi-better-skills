@@ -1,5 +1,11 @@
 import { describe, it, expect } from "bun:test";
-import { extractInlineSkillDisplays, inlineSkillsIntoText, planInlineSkillDelivery, type InlineSkillRef } from "../index";
+import {
+	extractInlineSkillDisplays,
+	inlineSkillsIntoText,
+	isOrdinarySingleLeadingSkillCommand,
+	planInlineSkillDelivery,
+	type InlineSkillRef,
+} from "../index";
 
 /**
  * `extractInlineSkillDisplays` lets one message reference multiple skills without
@@ -36,7 +42,7 @@ describe("extractInlineSkillDisplays leading skill", () => {
 });
 
 describe("extractInlineSkillDisplays visible prompt cleanup", () => {
-	it("replaces leading tokens with bare names when the extension owns a multi-skill prompt", () => {
+	it("strips the leading declaration when the extension owns a multi-skill prompt", () => {
 		const extract = harness(["torpathy", "ask-matt"]);
 		const result = extractInlineSkillDisplays(
 			"/skill:torpathy what's the best architecture? /skill:ask-matt",
@@ -47,7 +53,91 @@ describe("extractInlineSkillDisplays visible prompt cleanup", () => {
 		);
 
 		expect(result!.skills.map((skill) => skill.name)).toEqual(["torpathy", "ask-matt"]);
-		expect(result!.text).toBe("torpathy what's the best architecture? ask-matt");
+		expect(result!.text).toBe("what's the best architecture? ask-matt");
+	});
+
+	it("strips a leading declaration entirely, like pi core's own expansion", () => {
+		const extract = harness(["skill-creator"]);
+		const result = extractInlineSkillDisplays(
+			"/skill:skill-creator create me a skill for agentsmd",
+			(name) => (name === "skill-creator" ? ref(name) : undefined),
+			(skill) => `# ${skill.name}`,
+			undefined,
+			{ includeLeading: true },
+		);
+
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["skill-creator"]);
+		expect(result!.text).toBe("create me a skill for agentsmd");
+	});
+
+	it("strips a leading declaration preceded only by whitespace", () => {
+		const extract = harness(["a", "b"]);
+		const result = extractInlineSkillDisplays(
+			"  /skill:a hi /skill:b",
+			(name) => (name === "a" || name === "b" ? ref(name) : undefined),
+			(skill) => `# ${skill.name}`,
+			undefined,
+			{ includeLeading: true },
+		);
+
+		expect(result!.text).toBe("hi b");
+	});
+
+	it("leaves only the skill blocks when a bare leading invocation has no arguments", () => {
+		const extract = harness(["composite"]);
+		const result = extractInlineSkillDisplays(
+			"/skill:composite",
+			(name) => (name === "composite" ? ref(name) : undefined),
+			(skill) => `# ${skill.name}`,
+			undefined,
+			{ includeLeading: true },
+		);
+
+		expect(result!.text).toBe("");
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["composite"]);
+	});
+
+	it("keeps the bare name when stripping would expose a leading slash command", () => {
+		const extract = harness(["composite", "b"]);
+		const result = extractInlineSkillDisplays(
+			"/skill:composite /tmp/foo /skill:b",
+			(name) => (["composite", "b"].includes(name) ? ref(name) : undefined),
+			(skill) => `# ${skill.name}`,
+			undefined,
+			{ includeLeading: true },
+		);
+
+		// Bare-name substitution (not stripping) so the cleaned text does not
+		// start with "/": core's prompt-template expansion and the streaming
+		// slash-command exception would otherwise fire on an argument that was
+		// never at position 0.
+		expect(result!.text).toBe("composite /tmp/foo b");
+	});
+
+	it("combines leading fallback, whitespace, unknown tokens, and later extraction", () => {
+		const result = extractInlineSkillDisplays(
+			" \t/skill:lead /tmp/foo /skill:missing /skill:later",
+			(name) => (["lead", "later"].includes(name) ? ref(name) : undefined),
+			(skill) => `${skill.name} body`,
+			undefined,
+			{ includeLeading: true },
+		);
+
+		expect(result!.text).toBe("lead /tmp/foo /skill:missing later");
+		expect(result!.skills.map((skill) => skill.name)).toEqual(["lead", "later"]);
+	});
+
+	it("still strips when the only slash in the remainder is a following /skill: token", () => {
+		// The following token is rewritten to its bare name, so stripping the
+		// leading declaration cannot leave a slash at position 0.
+		const result = extractInlineSkillDisplays(
+			"/skill:grilling /skill:handoff",
+			(name) => (["grilling", "handoff"].includes(name) ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		);
+		expect(result!.text).toBe("handoff");
 	});
 
 	it("removes a non-leading token and keeps the leading skill for core by default", () => {
@@ -121,6 +211,13 @@ describe("extractInlineSkillDisplays bare-name substitution", () => {
 
 		expect(result!.text).toBe("I added the skill diagnosing-bugs inline here");
 	});
+
+	it("does not treat a one-character prefix as leading whitespace", () => {
+		const extract = harness(["a"]);
+		const result = extract("x /skill:a");
+
+		expect(result!.text).toBe("x a");
+	});
 });
 
 describe("extractInlineSkillDisplays decoration (<skill_context>)", () => {
@@ -168,6 +265,17 @@ describe("inlineSkillsIntoText (steer/followUp single-entry delivery)", () => {
 	it("returns the text unchanged when there are no skills", () => {
 		expect(inlineSkillsIntoText("just text", [])).toBe("just text");
 	});
+
+	it("returns the blocks alone when there is no user text", () => {
+		const result = extractInlineSkillDisplays(
+			"/skill:composite",
+			(name) => (name === "composite" ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		)!;
+		expect(inlineSkillsIntoText(result.text, result.skills)).toBe(result.skills[0].block);
+	});
 });
 
 describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
@@ -202,6 +310,86 @@ describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
 		expect(plan.text).not.toContain("a body");
 	});
 
+	it("idle with an empty prompt: inlines the blocks as the user message instead of sending empty text", () => {
+		const result = extractInlineSkillDisplays(
+			"/skill:composite",
+			(name) => (name === "composite" ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		)!;
+		const plan = planInlineSkillDelivery(result, false);
+
+		expect(plan.messages).toEqual([]);
+		expect(plan.text).toBe(result.skills[0].block);
+	});
+
+	it("idle with an empty prompt and multiple blocks: earlier skills ride as rows, the last as the user text", () => {
+		// A bare composite skill expands to parent + referenced children; one
+		// concatenated user message would break core's parseSkillBlock, which
+		// parses only a single leading <skill> block per user message.
+		const result = extractInlineSkillDisplays(
+			"/skill:composite",
+			(name) => (["composite", "child"].includes(name) ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		)!;
+		const batch = [
+			result.skills[0],
+			{ ...result.skills[0], name: "child", block: "<skill name=\"child\">\nCHILD\n</skill>" },
+		];
+		const plan = planInlineSkillDelivery({ text: result.text, skills: batch }, false);
+
+		expect(plan.messages).toEqual([batch[0]]);
+		expect(plan.text).toBe(batch[1].block);
+	});
+
+	it("streaming takes precedence over the empty-prompt fallback", () => {
+		const skills = [
+			{ ...ref("first"), content: "FIRST", block: "<skill name=\"first\">\nFIRST\n</skill>" },
+			{ ...ref("last"), content: "LAST", block: "<skill name=\"last\">\nLAST\n</skill>" },
+		];
+
+		const plan = planInlineSkillDelivery({ text: "", skills }, true);
+
+		expect(plan.messages).toEqual([]);
+		expect(plan.text).toBe(`${skills[0].block}\n\n${skills[1].block}`);
+	});
+
+	it("idle treats whitespace-only text as an empty prompt", () => {
+		const skills = [
+			{ ...ref("first"), content: "FIRST", block: "FIRST BLOCK" },
+			{ ...ref("last"), content: "LAST", block: "LAST BLOCK" },
+		];
+
+		const plan = planInlineSkillDelivery({ text: " \t\n", skills }, false);
+
+		expect(plan.messages).toEqual([skills[0]]);
+		expect(plan.text).toBe(skills[1].block);
+	});
+
+	it("does not synthesize a last block when an empty prompt has no skills", () => {
+		const plan = planInlineSkillDelivery({ text: "", skills: [] }, false);
+
+		expect(plan).toEqual({ text: "", messages: [] });
+	});
+
+	it("streaming with slash-args exposed by stripping still inlines (bare-name fallback kept text unslashy)", () => {
+		const result = extractInlineSkillDisplays(
+			"/skill:composite /tmp/foo",
+			(name) => (name === "composite" ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		)!;
+		expect(result.text).toBe("composite /tmp/foo");
+
+		const plan = planInlineSkillDelivery(result, true);
+		expect(plan.messages).toEqual([]);
+		expect(plan.text).toBe(inlineSkillsIntoText(result.text, result.skills));
+	});
+
 	it("streaming with a leading slash-command: does NOT inline, so core can still expand it", () => {
 		// e.g. `/tmpl arg /skill:a` -> cleaned text `/tmpl arg a`. Prepending skill XML
 		// would move the leading `/tmpl` off position 0 and defeat core's prompt-template
@@ -219,6 +407,41 @@ describe("planInlineSkillDelivery (the streaming-regression seam)", () => {
 		expect(plan.text).toBe("/tmpl arg a"); // leading token preserved at position 0
 		expect(plan.messages).toBe(result.skills); // skill delivered as a separate message
 		expect(plan.text.startsWith("/")).toBe(true);
+	});
+});
+
+describe("isOrdinarySingleLeadingSkillCommand (deferral grammar mirrors core)", () => {
+	const skills = [{ ...ref("a"), content: "c", block: "b" }];
+
+	it("defers the exact forms core expands", () => {
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a hello", skills)).toBe(true);
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a", skills)).toBe(true);
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a  double space", skills)).toBe(true);
+	});
+
+	it("never defers forms core passes through verbatim", () => {
+		// Core requires strict startsWith + space delimiter; deferring these
+		// would leave the declaration in the sent message.
+		expect(isOrdinarySingleLeadingSkillCommand("  /skill:a hello", skills)).toBe(false);
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a\nhello", skills)).toBe(false);
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a\thello", skills)).toBe(false);
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:ab hello", skills)).toBe(false);
+	});
+
+	it("does not defer when the extracted batch is not exactly one skill", () => {
+		expect(isOrdinarySingleLeadingSkillCommand("/skill:a", [])).toBe(false);
+	});
+
+	it("extension-owned whitespace-prefixed commands strip the declaration", () => {
+		const extract = harness(["a"]);
+		const result = extractInlineSkillDisplays(
+			"  /skill:a hello",
+			(name) => (name === "a" ? ref(name) : undefined),
+			() => "BODY",
+			undefined,
+			{ includeLeading: true },
+		);
+		expect(result!.text).toBe("hello");
 	});
 });
 
@@ -254,5 +477,17 @@ describe("extractInlineSkillDisplays token boundaries", () => {
 		expect(result).not.toBeUndefined();
 		expect(result!.text).toContain("foo/skill:x");
 		expect(result!.text).not.toContain("/skill:x real");
+	});
+
+	it("returns undefined when every skill marker is embedded", () => {
+		const extract = harness(["x"]);
+		expect(extract("see foo/skill:x")).toBeUndefined();
+	});
+
+	it("trims whitespace from both ends after replacing a token", () => {
+		const extract = harness(["x"]);
+		const result = extract(" \nhello /skill:x \t\n");
+
+		expect(result!.text).toBe("hello x");
 	});
 });
