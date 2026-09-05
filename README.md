@@ -246,7 +246,7 @@ If the running session has more tokens than the target model's `contextWindow`, 
 
 ## Auto-injecting skills with `globs`
 
-Skills with a `globs` field in their frontmatter get injected when you read a matching file. You don't need to load the skill manually. The extension watches `read` tool calls, checks each skill's globs against the file path, and prepends matching skill content to the result.
+Skills with a `globs` field in their frontmatter get injected when a tool touches a matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
 
 ### Frontmatter format
 

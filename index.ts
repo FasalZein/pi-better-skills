@@ -22,6 +22,7 @@ import {
 	type RefDeps,
 } from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
+import { extractPathCandidates } from "./tool-paths";
 
 type SkillRecord = {
 	name: string;
@@ -1127,14 +1128,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 		// Phase 1: Identify the directly targeted skill (SKILL.md read / bash referencing SKILL.md)
 		let skill: SkillRecord | undefined;
-		let readPath: string | undefined;
 
 		if (event.toolName === "read") {
 			const inputPath = typeof event.input.path === "string" ? event.input.path : undefined;
-			if (inputPath) {
-				skill = findSkillForPath(inputPath);
-				readPath = isAbsolute(inputPath) ? inputPath : resolve(ctx.cwd, inputPath);
-			}
+			if (inputPath) skill = findSkillForPath(inputPath);
 		} else if (event.toolName === "bash") {
 			const command = typeof event.input.command === "string" ? event.input.command : undefined;
 			if (command) skill = findSkillReferencedByCommand(command, ctx.cwd);
@@ -1143,30 +1140,37 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			// Tool-agnostic skill detection: any tool (e.g. an MCP `exec_command`)
 			// whose input strings reference a known SKILL.md path counts as a
 			// skill read and gets the same enrichment as core `read`/`bash`.
-			// Writes are excluded, and the result must actually contain the skill
-			// body — commands that merely mention the path (echo/stat/ls) must not
-			// mark a skill loaded or receive enrichment.
-			if (event.toolName === "edit" || event.toolName === "write") return;
-			for (const value of Object.values(event.input ?? {})) {
-				if (typeof value !== "string") continue;
-				skill = findSkillReferencedByCommand(value, ctx.cwd);
-				if (skill) break;
+			// Writes are excluded here (a write is not a skill read), and the
+			// result must actually contain the skill body — commands that merely
+			// mention the path (echo/stat/ls) must not mark a skill loaded or
+			// receive enrichment. Writes still join every other tool in the
+			// globs matching below.
+			if (event.toolName !== "edit" && event.toolName !== "write") {
+				for (const value of Object.values(event.input ?? {})) {
+					if (typeof value !== "string") continue;
+					skill = findSkillReferencedByCommand(value, ctx.cwd);
+					if (skill) break;
+				}
 			}
-			if (!skill || !confirmedSkillRead(event, skill)) return;
+			if (skill && !confirmedSkillRead(event, skill)) return;
 		}
 
-		// Phase 2: Find skills whose globs match the read path (globs-based auto-injection)
+		// Phase 2: Find skills whose globs match a path named by the tool input
+		// (globs-based auto-injection). The trigger is generic path extraction over
+		// any tool's input — keyed on location-naming, not tool identity — so
+		// sessions whose read/bash tools were replaced or wrapped by another
+		// extension keep glob injection working. Candidates must exist on disk;
+		// bare tokens without a separator or extension only count when a
+		// structured path key (path, file_path, ...) names them.
 		const toInject: SkillRecord[] = [];
-		if (event.toolName === "read" && readPath) {
-			const resolvedPath = resolve(readPath);
-			for (const s of skills.values()) {
-				if (!hasAutoInjectableGlobs(s)) continue;
-				if (skill && skill.name === s.name) continue;
-				// Per-turn deduplication: don't re-inject skills already loaded this turn
-				if (injectedThisTurn.has(s.name)) continue;
-				if (matchesGlobs(resolvedPath, s.globs!)) {
-					toInject.push(s);
-				}
+		const candidatePaths = extractPathCandidates(event.input, ctx.cwd).filter((candidate) => existsSync(candidate));
+		for (const s of skills.values()) {
+			if (!hasAutoInjectableGlobs(s)) continue;
+			if (skill && skill.name === s.name) continue;
+			// Per-turn deduplication: don't re-inject skills already loaded this turn
+			if (injectedThisTurn.has(s.name)) continue;
+			if (candidatePaths.some((candidate) => matchesGlobs(candidate, s.globs!))) {
+				toInject.push(s);
 			}
 		}
 
@@ -1180,7 +1184,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		// Start with the original content blocks
 		const allBlocks: any[] = [...event.content];
 
-		// Prepend injected skill content (only for read events with globs matches)
+		// Prepend injected skill content (skills whose globs matched a tool-input path)
 		for (const injSkill of toInject) {
 			try {
 				const rawContent = readFileSync(injSkill.filePath, "utf-8");
