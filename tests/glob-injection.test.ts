@@ -827,4 +827,90 @@ describe("skill-identity residency collisions", () => {
 			project.cleanup();
 		}
 	});
+
+	it("does not let incomplete skill anchors borrow a body from a later message", async () => {
+		const body = "Borrowed body marker.\n";
+		for (const anchorKind of ["context", "wrapper"] as const) {
+			const project = await setupProject({
+				".pi/skills/borrow-skill/SKILL.md": `---\nname: borrow-skill\ndescription: Borrow conventions\nglobs: ["**/*.borrow"]\n---\n\n${body}`,
+				"src/one.borrow": "borrow content",
+			});
+			try {
+				const skillPath = join(project.root, ".pi/skills/borrow-skill/SKILL.md");
+				const anchor =
+					anchorKind === "context"
+						? `<skill_context>\n  <skill_dir>${dirname(skillPath)}</skill_dir>\n</skill_context>`
+						: `<skill name="borrow-skill" location="${skillPath}">\nReferences are relative to ${dirname(skillPath)}.\n\n[truncated]`;
+				project.setSessionContext([
+					{
+						role: "toolResult",
+						toolCallId: `${anchorKind}-anchor`,
+						toolName: "read",
+						content: [{ type: "text", text: anchor }],
+						isError: false,
+						timestamp: Date.now(),
+					},
+					{ role: "assistant", content: [{ type: "text", text: body }], timestamp: Date.now() },
+				]);
+
+				const result = await deliverToolResult(project, toolResult("read", { path: "src/one.borrow" }));
+				expect(resultText(result)).toContain(body.trim());
+			} finally {
+				project.cleanup();
+			}
+		}
+	});
+
+	it("keeps residency when a skill body contains anchor-like text", async () => {
+		const body = 'Doc marker head.\nExample wrapper: <skill name="ghost" location="/x/SKILL.md">\nDoc marker tail.\n';
+		const project = await setupProject({
+			".pi/skills/doc-skill/SKILL.md": `---\nname: doc-skill\ndescription: Documents wrapper syntax\nglobs: ["**/*.doc"]\n---\n\n${body}`,
+			"src/one.doc": "one",
+			"src/two.doc": "two",
+		});
+		try {
+			const first = await deliverToolResult(project, toolResult("read", { path: "src/one.doc" }));
+			expect(resultText(first)).toContain("Doc marker tail.");
+
+			const second = await deliverToolResult(project, toolResult("read", { path: "src/two.doc" }));
+			expect(second).toBeUndefined();
+		} finally {
+			project.cleanup();
+		}
+	});
+
+	it("does not attribute a literal wrapper to a loaded skill at another location", async () => {
+		const betaBody = "Beta required body.\n";
+		const project = await setupProject({
+			".pi/skills/alpha-skill/SKILL.md": `---\nname: alpha-skill\ndescription: Alpha conventions\nglobs: ["**/*.alpha"]\n---\n\nAlpha body.\nExample: <skill name="beta-skill" location="/example/beta/SKILL.md">\n${betaBody}</skill>\n`,
+			".pi/skills/beta-skill/SKILL.md": `---\nname: beta-skill\ndescription: Beta conventions\nglobs: ["**/*.beta"]\n---\n\n${betaBody}`,
+			"src/one.alpha": "alpha",
+			"src/two.beta": "beta",
+		});
+		try {
+			const alpha = await deliverToolResult(project, toolResult("read", { path: "src/one.alpha" }));
+			expect(resultText(alpha)).toContain("Alpha body.");
+
+			const beta = await deliverToolResult(project, toolResult("read", { path: "src/two.beta" }));
+			expect(resultText(beta)).toContain(join(project.root, ".pi/skills/beta-skill"));
+		} finally {
+			project.cleanup();
+		}
+	});
+
+	it("does not count an unanchored persisted body as resident", async () => {
+		const body = "Unanchored body marker.\n";
+		const project = await setupProject({
+			".pi/skills/unanchored-skill/SKILL.md": `---\nname: unanchored-skill\ndescription: Unanchored conventions\nglobs: ["**/*.unanchored"]\n---\n\n${body}`,
+			"src/one.unanchored": "content",
+		});
+		try {
+			project.setSessionContext([{ role: "assistant", content: [{ type: "text", text: body }], timestamp: Date.now() }]);
+
+			const result = await deliverToolResult(project, toolResult("read", { path: "src/one.unanchored" }));
+			expect(resultText(result)).toContain(body.trim());
+		} finally {
+			project.cleanup();
+		}
+	});
 });

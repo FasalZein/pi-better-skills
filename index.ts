@@ -985,12 +985,42 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	}
 
 	type SessionContextMessage = ReturnType<typeof buildSessionContext>["messages"][number];
+	type ResidencyAnchor =
+		| { kind: "directory"; directory: string; start: number; end: number }
+		| { kind: "wrapper"; name: string; location: string; start: number; end: number };
+	type ResidencyMessage = { text: string; anchors: ResidencyAnchor[] };
 
 	function sessionMessageText(message: SessionContextMessage): string {
 		if (message.role === "toolResult" && message.isError) return "";
 		if ("content" in message) return contentText(message.content);
 		if ("summary" in message) return message.summary;
 		return "";
+	}
+
+	// Body text cannot identify a skill because distinct skills can share or
+	// contain the same text. Anchors bind complete bodies to one skill identity.
+	function residencyMessage(message: SessionContextMessage): ResidencyMessage | undefined {
+		const text = normalizeSkillText(sessionMessageText(message));
+		if (!text) return undefined;
+		const anchors: ResidencyAnchor[] = [];
+		for (const match of text.matchAll(/<skill_context> <skill_dir>([^<]+)<\/skill_dir>|<skill\b([^>]*)>/g)) {
+			if (match.index === undefined) continue;
+			const start = match.index;
+			const end = start + match[0].length;
+			if (match[1] !== undefined) {
+				anchors.push({ kind: "directory", directory: match[1], start, end });
+				continue;
+			}
+			const attributes = match[2] ?? "";
+			const nameMatch = attributes.match(/\bname=(?:"([^"]+)"|'([^']+)')/);
+			const locationMatch = attributes.match(/\blocation=(?:"([^"]+)"|'([^']+)')/);
+			const name = nameMatch?.[1] ?? nameMatch?.[2];
+			const location = locationMatch?.[1] ?? locationMatch?.[2];
+			if (name !== undefined && location !== undefined) {
+				anchors.push({ kind: "wrapper", name, location, start, end });
+			}
+		}
+		return { text, anchors };
 	}
 
 
@@ -1015,22 +1045,11 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		for (const message of context.messages) {
 			if (message.role === "toolResult") releaseToolCallReservations(message.toolCallId);
 		}
-		const contextText = normalizeSkillText(context.messages.map(sessionMessageText).filter(Boolean).join("\n"));
-
-		// Residency evidence must be skill-specific: two skills can share body
-		// text (identical bodies, or one body containing the other), so a plain
-		// text match aliases them. Attribute delivered text to a skill only
-		// through its own anchors: the <skill_dir> of an injected skill_context
-		// block, or a <skill name="..."> wrapper (pi core /skill expansion and
-		// extension-injected rows). Unanchored echoes count for no skill.
-		const anchors: Array<{ key: string; start: number; end: number }> = [];
-		for (const match of contextText.matchAll(/<skill_context> <skill_dir>([^<]+)<\/skill_dir>|<skill name="([A-Za-z0-9._-]+)"[^>]*>/g)) {
-			anchors.push({
-				key: match[1] !== undefined ? `dir:${match[1]}` : `name:${match[2]}`,
-				start: match.index ?? 0,
-				end: (match.index ?? 0) + match[0].length,
-			});
-		}
+		// Evidence stays inside one persisted message. This prevents an incomplete
+		// anchor from claiming a matching body that appears in a later message.
+		const messages = context.messages
+			.map(residencyMessage)
+			.filter((message): message is ResidencyMessage => message !== undefined);
 
 		const next = new Set<string>();
 		for (const skill of skills.values()) {
@@ -1039,15 +1058,27 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			const normalizedBody = normalizeSkillText(body);
 			if (!normalizedBody) continue;
 			const passiveBody = normalizeSkillText(neutralizeDynamicPlaceholders(body));
-			const keys = new Set([`dir:${skill.baseDir}`, `name:${skill.name}`]);
-			for (const [index, anchor] of anchors.entries()) {
-				if (!keys.has(anchor.key)) continue;
-				const following = anchors[index + 1];
-				const segment = contextText.slice(anchor.end, following ? following.start : contextText.length);
-				if (segment.includes(normalizedBody) || segment.includes(passiveBody)) {
-					next.add(skill.name);
-					break;
+			const candidates = new Set([normalizedBody, passiveBody]);
+			for (const message of messages) {
+				for (const [index, anchor] of message.anchors.entries()) {
+					const matchesSkill =
+						anchor.kind === "directory"
+							? anchor.directory === skill.baseDir
+							: anchor.name === skill.name && anchor.location === skill.filePath;
+					if (!matchesSkill) continue;
+					const following = message.anchors[index + 1];
+					const resident = Array.from(candidates).some((candidate) => {
+						const bodyStart = message.text.indexOf(candidate, anchor.end);
+						// A later delivery anchor owns bodies that start after it. An
+						// anchor-like literal at or inside this body does not truncate it.
+						return bodyStart >= 0 && (!following || bodyStart <= following.start);
+					});
+					if (resident) {
+						next.add(skill.name);
+						break;
+					}
 				}
+				if (next.has(skill.name)) break;
 			}
 		}
 
