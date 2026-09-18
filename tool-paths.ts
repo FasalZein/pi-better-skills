@@ -13,26 +13,23 @@ import { resolve } from "node:path";
  * that put no file content in context.
  */
 
+/** Keys that name a target location. Plural forms carry a list, as in MCP `read_multiple_files`. */
 const PATH_KEYS = new Set([
 	"path",
-	"file",
-	"filepath",
-	"file_path",
-	"workdir",
-	"cwd",
-	"directory",
-	"dir",
-	"notebookpath",
-	"notebook_path",
-	// Plural forms carry a list, as in the MCP `read_multiple_files` shape.
 	"paths",
+	"file",
 	"files",
+	"filepath",
 	"filepaths",
+	"file_path",
 	"file_paths",
+	"notebookpath",
 	"notebookpaths",
+	"notebook_path",
 	"notebook_paths",
 ]);
 
+/** Keys that name the directory a record's relative paths resolve against. */
 const BASE_KEYS = new Set(["workdir", "cwd", "directory", "dir"]);
 
 const MAX_DEPTH = 2;
@@ -66,8 +63,8 @@ function resolveRecordBase(entries: Array<[string, unknown]>, base: string, addC
 function walkEntries(entries: Array<[string, unknown]>, depth: number, recordBase: string, addCandidate: CandidateAdder) {
 	for (const [key, child] of entries) {
 		const normalizedKey = key.toLowerCase();
-		// BASE_KEYS values were already added as candidates while resolving recordBase.
-		const isPathKey = PATH_KEYS.has(normalizedKey) && !BASE_KEYS.has(normalizedKey);
+		// Base keys were already added as candidates while resolving recordBase.
+		const isPathKey = PATH_KEYS.has(normalizedKey);
 		if (typeof child === "string") {
 			if (isPathKey) addCandidate(child, recordBase);
 		} else if (isPathKey && Array.isArray(child)) {
