@@ -33,10 +33,9 @@ async function loadExtension() {
 	return (await import("../index")).default;
 }
 
-function makeFakePi(cwd: string, initialMessages: unknown[] = []) {
+function makeFakePi(cwd: string) {
 	const handlers = new Map<string, Handler[]>();
 	const sessionManager = SessionManager.inMemory(cwd);
-	for (const message of initialMessages) sessionManager.appendMessage(message as PersistedMessage);
 	const ctx: FakeContext = {
 		cwd,
 		isProjectTrusted: () => true,
@@ -110,7 +109,7 @@ function makeFakePi(cwd: string, initialMessages: unknown[] = []) {
 	};
 }
 
-async function setupProject(files: Record<string, string>, initialMessages: unknown[] = []) {
+async function setupProject(files: Record<string, string>) {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-better-skills-globs-")));
 	for (const [relative, content] of Object.entries(files)) {
 		const full = join(root, relative);
@@ -118,7 +117,7 @@ async function setupProject(files: Record<string, string>, initialMessages: unkn
 		writeFileSync(full, content, "utf-8");
 	}
 	const extension = await loadExtension();
-	const { pi, ctx, setSessionContext, emit } = makeFakePi(root, initialMessages);
+	const { pi, ctx, setSessionContext, emit } = makeFakePi(root);
 	(extension as (pi: unknown) => void)(pi);
 	await emit("session_start", {});
 	return { root, ctx, pi, setSessionContext, emit, cleanup: () => rmSync(root, { recursive: true, force: true }) };
@@ -394,8 +393,14 @@ describe("globs auto-injection via arbitrary tools", () => {
 			const first = await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }));
 			expect(resultText(first)).toContain("Widget body marker.");
 
-			project.setSessionContext([]);
+			// Real compaction: kept messages start after the delivered result.
+			const manager = project.ctx.sessionManager;
+			manager.appendMessage({ role: "user", content: "next turn", timestamp: Date.now() });
+			const cutoff = manager.getEntries().at(-1)?.id;
+			if (!cutoff) throw new Error("no entry for compaction cutoff");
+			manager.appendCompaction("Summary without the body.", cutoff, 1000);
 			await project.emit("session_compact", {});
+
 			const afterCompact = await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }));
 			expect(resultText(afterCompact)).toContain("Widget body marker.");
 		} finally {
@@ -410,10 +415,16 @@ describe("globs auto-injection via arbitrary tools", () => {
 			"src/Icon.widget": "icon content",
 		});
 		try {
-			const first = (await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }))) as
-				| { content?: TextBlock[] }
-				| undefined;
-			project.setSessionContext([{ role: "toolResult", content: first?.content ?? [] }]);
+			const first = await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }));
+			expect(resultText(first)).toContain("Widget body marker.");
+
+			// Real compaction that keeps the delivered result itself.
+			const manager = project.ctx.sessionManager;
+			const cutoff = manager
+				.getEntries()
+				.find((entry) => entry.type === "message" && "message" in entry && entry.message.role === "toolResult")?.id;
+			if (!cutoff) throw new Error("no toolResult entry for compaction cutoff");
+			manager.appendCompaction("Summary that keeps the delivered result.", cutoff, 1000);
 			await project.emit("session_compact", {});
 
 			const second = await deliverToolResult(project, toolResult("read", { path: "src/Icon.widget" }));
@@ -553,23 +564,25 @@ describe("globs auto-injection via arbitrary tools", () => {
 	});
 
 	it("reconciles residency from a resumed session context", async () => {
-		const project = await setupProject(
-			{
-				".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
-				"src/Button.widget": "button content",
-			},
-			[
+		const project = await setupProject({
+			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
+			"src/Button.widget": "button content",
+		});
+		try {
+			// Realistic resumed history: a persisted /skill expansion carries the
+			// skill-name anchor that residency attribution requires.
+			project.setSessionContext([
 				{
-					role: "toolResult",
-					toolCallId: "resumed-call",
-					toolName: "read",
-					content: [{ type: "text", text: WIDGET_SKILL }],
-					isError: false,
+					role: "user",
+					content:
+						'<skill name="widget-patterns" location="' +
+						join(project.root, ".pi/skills/widget-patterns/SKILL.md") +
+						'">\nReferences are relative to ' +
+						join(project.root, ".pi/skills/widget-patterns") +
+						'.\n\nWidget body marker.\n</skill>',
 					timestamp: Date.now(),
 				},
-			],
-		);
-		try {
+			]);
 			const result = await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }));
 			expect(result).toBeUndefined();
 		} finally {
@@ -584,13 +597,14 @@ describe("globs auto-injection via arbitrary tools", () => {
 			"src/Icon.widget": "icon content",
 		});
 		try {
-			const first = (await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }))) as
-				| { content?: TextBlock[] }
-				| undefined;
-			project.setSessionContext([{ role: "toolResult", content: first?.content ?? [] }]);
-			await project.emit("session_tree", { type: "session_tree", oldLeafId: "old", newLeafId: "kept" });
-			project.setSessionContext([{ role: "user", content: "new branch" }]);
-			await project.emit("session_tree", { type: "session_tree", oldLeafId: "kept", newLeafId: "new" });
+			const first = await deliverToolResult(project, toolResult("read", { path: "src/Button.widget" }));
+			expect(resultText(first)).toContain("Widget body marker.");
+
+			// Real navigation to the session root: the delivered result leaves
+			// the active branch, exactly like /tree on the first user message.
+			const manager = project.ctx.sessionManager;
+			manager.resetLeaf();
+			await project.emit("session_tree", { type: "session_tree", oldLeafId: "old", newLeafId: null });
 
 			const restored = await deliverToolResult(project, toolResult("read", { path: "src/Icon.widget" }));
 			expect(resultText(restored)).toContain("Widget body marker.");
@@ -768,6 +782,47 @@ describe("skill references in multi-block tool results", () => {
 			second.content = [{ type: "text", text: "Script completed" }, { type: "text", text: parentBody }];
 			const repeated = await deliverToolResult(project, second);
 			expect(resultText(repeated)).not.toContain("Notebook child marker.");
+		} finally {
+			project.cleanup();
+		}
+	});
+});
+
+describe("skill-identity residency collisions", () => {
+	it("injects a second skill whose body is identical to an already delivered one", async () => {
+		const body = "Identical body marker.\nSame text, different skill roots.\n";
+		const project = await setupProject({
+			".pi/skills/alpha-dup/SKILL.md": `---\nname: alpha-dup\ndescription: Alpha duplicate\nglobs: ["**/*.alpha"]\n---\n\n${body}`,
+			".pi/skills/beta-dup/SKILL.md": `---\nname: beta-dup\ndescription: Beta duplicate\nglobs: ["**/*.beta"]\n---\n\n${body}`,
+			"src/a.alpha": "alpha content",
+			"src/b.beta": "beta content",
+		});
+		try {
+			const first = await deliverToolResult(project, toolResult("read", { path: "src/a.alpha" }));
+			expect(resultText(first)).toContain("Identical body marker.");
+
+			const second = await deliverToolResult(project, toolResult("read", { path: "src/b.beta" }));
+			expect(resultText(second)).toContain("Identical body marker.");
+		} finally {
+			project.cleanup();
+		}
+	});
+
+	it("injects a skill whose body is contained in another delivered body", async () => {
+		const shortBody = "Shared core marker.\n";
+		const longBody = "Shared core marker.\nAlpha-only superset guidance lives here.\n";
+		const project = await setupProject({
+			".pi/skills/super-set/SKILL.md": `---\nname: super-set\ndescription: Superset skill\nglobs: ["**/*.super"]\n---\n\n${longBody}`,
+			".pi/skills/sub-set/SKILL.md": `---\nname: sub-set\ndescription: Subset skill\nglobs: ["**/*.sub"]\n---\n\n${shortBody}`,
+			"src/full.super": "super content",
+			"src/part.sub": "sub content",
+		});
+		try {
+			const first = await deliverToolResult(project, toolResult("read", { path: "src/full.super" }));
+			expect(resultText(first)).toContain("Alpha-only superset guidance");
+
+			const second = await deliverToolResult(project, toolResult("read", { path: "src/part.sub" }));
+			expect(resultText(second)).toContain("Shared core marker.");
 		} finally {
 			project.cleanup();
 		}

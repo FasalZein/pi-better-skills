@@ -1017,18 +1017,38 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		}
 		const contextText = normalizeSkillText(context.messages.map(sessionMessageText).filter(Boolean).join("\n"));
 
+		// Residency evidence must be skill-specific: two skills can share body
+		// text (identical bodies, or one body containing the other), so a plain
+		// text match aliases them. Attribute delivered text to a skill only
+		// through its own anchors: the <skill_dir> of an injected skill_context
+		// block, or a <skill name="..."> wrapper (pi core /skill expansion and
+		// extension-injected rows). Unanchored echoes count for no skill.
+		const anchors: Array<{ key: string; start: number; end: number }> = [];
+		for (const match of contextText.matchAll(/<skill_context> <skill_dir>([^<]+)<\/skill_dir>|<skill name="([A-Za-z0-9._-]+)"[^>]*>/g)) {
+			anchors.push({
+				key: match[1] !== undefined ? `dir:${match[1]}` : `name:${match[2]}`,
+				start: match.index ?? 0,
+				end: (match.index ?? 0) + match[0].length,
+			});
+		}
+
 		const next = new Set<string>();
 		for (const skill of skills.values()) {
 			const body = readSkillBody(skill);
 			if (!body) continue;
 			const normalizedBody = normalizeSkillText(body);
 			if (!normalizedBody) continue;
-			if (contextText.includes(normalizedBody)) {
-				next.add(skill.name);
-				continue;
-			}
 			const passiveBody = normalizeSkillText(neutralizeDynamicPlaceholders(body));
-			if (contextText.includes(passiveBody)) next.add(skill.name);
+			const keys = new Set([`dir:${skill.baseDir}`, `name:${skill.name}`]);
+			for (const [index, anchor] of anchors.entries()) {
+				if (!keys.has(anchor.key)) continue;
+				const following = anchors[index + 1];
+				const segment = contextText.slice(anchor.end, following ? following.start : contextText.length);
+				if (segment.includes(normalizedBody) || segment.includes(passiveBody)) {
+					next.add(skill.name);
+					break;
+				}
+			}
 		}
 
 		injectedSkillNames = next;
