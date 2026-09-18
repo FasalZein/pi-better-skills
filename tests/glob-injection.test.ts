@@ -4,10 +4,11 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 /**
- * Globs auto-injection through the registered tool_result handler. The
- * trigger is generic path extraction over any tool's input, not tool
- * identity, so sessions whose read/bash tools were replaced or wrapped by
- * another extension (MCP exec-style tools, wrapped editors) keep working.
+ * Globs auto-injection through the registered tool_result handler. The trigger
+ * is a structured path key in any tool's input, not tool identity, so sessions
+ * whose read tool was replaced or wrapped by another extension (MCP file tools,
+ * wrapped editors) keep working. Free-form strings such as shell commands are
+ * not scanned: a command line mentions paths it never opens.
  */
 
 type TextBlock = { type: "text"; text: string };
@@ -86,21 +87,7 @@ Widget body marker.
 `;
 
 describe("globs auto-injection via arbitrary tools", () => {
-	it("injects a matching skill for a foreign exec-style tool result", async () => {
-		const project = await setupProject({
-			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
-			"src/Button.widget": "button content",
-		});
-		try {
-			const result = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Button.widget" }));
-			expect(resultText(result)).toContain("Widget body marker.");
-			expect(resultText(result)).toContain("tool output");
-		} finally {
-			project.cleanup();
-		}
-	});
-
-	it("injects from a structured path key on an arbitrary tool", async () => {
+	it("injects from a structured path key on a foreign tool result", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
 			"src/Button.widget": "button content",
@@ -108,12 +95,13 @@ describe("globs auto-injection via arbitrary tools", () => {
 		try {
 			const result = await project.emit("tool_result", toolResult("mcp__fs__view", { file_path: "src/Button.widget" }));
 			expect(resultText(result)).toContain("Widget body marker.");
+			expect(resultText(result)).toContain("tool output");
 		} finally {
 			project.cleanup();
 		}
 	});
 
-	it("resolves command tokens against a workdir base key", async () => {
+	it("resolves a structured path key against a workdir base key", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
 			"src/Button.widget": "button content",
@@ -121,7 +109,7 @@ describe("globs auto-injection via arbitrary tools", () => {
 		try {
 			const result = await project.emit(
 				"tool_result",
-				toolResult("exec_command", { command: "cat Button.widget", workdir: join(project.root, "src") }),
+				toolResult("mcp__fs__view", { file: "Button.widget", workdir: join(project.root, "src") }),
 			);
 			expect(resultText(result)).toContain("Widget body marker.");
 		} finally {
@@ -142,14 +130,23 @@ describe("globs auto-injection via arbitrary tools", () => {
 		}
 	});
 
-	it("injects for bash commands that read a matching path", async () => {
+	it("never injects from a command line that only names a matching path", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
 			"src/Button.widget": "button content",
 		});
 		try {
-			const result = await project.emit("tool_result", toolResult("bash", { command: "cat src/Button.widget" }));
-			expect(resultText(result)).toContain("Widget body marker.");
+			// `ls`/`grep -c` put no file content in context, and a shell tool is not a
+			// file visit. Scanning command strings made every such call cost a full
+			// skill body.
+			const listing = await project.emit("tool_result", toolResult("bash", { command: "ls -la src/Button.widget" }));
+			expect(listing).toBeUndefined();
+
+			const counted = await project.emit("tool_result", toolResult("bash", { command: "grep -c . src/Button.widget" }));
+			expect(counted).toBeUndefined();
+
+			const foreign = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Button.widget" }));
+			expect(foreign).toBeUndefined();
 		} finally {
 			project.cleanup();
 		}
@@ -171,23 +168,41 @@ describe("globs auto-injection via arbitrary tools", () => {
 		}
 	});
 
-	it("dedupes injections per turn and re-injects on the next turn", async () => {
+	it("injects a skill once per session, not once per turn", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
 			"src/Button.widget": "button content",
 			"src/Icon.widget": "icon content",
 		});
 		try {
-			await project.emit("turn_start", {});
-			const first = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Button.widget" }));
+			const first = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
 			expect(resultText(first)).toContain("Widget body marker.");
 
-			const second = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Icon.widget" }));
+			const second = await project.emit("tool_result", toolResult("read", { path: "src/Icon.widget" }));
 			expect(second).toBeUndefined();
 
-			await project.emit("turn_start", {});
-			const third = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Icon.widget" }));
-			expect(resultText(third)).toContain("Widget body marker.");
+			// A later turn must not pay for the body again: the modified tool result
+			// is persisted in session history, so the first copy is still in context.
+			await project.emit("agent_end", {});
+			const nextTurn = await project.emit("tool_result", toolResult("read", { path: "src/Icon.widget" }));
+			expect(nextTurn).toBeUndefined();
+		} finally {
+			project.cleanup();
+		}
+	});
+
+	it("re-injects after compaction summarizes the body out of context", async () => {
+		const project = await setupProject({
+			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
+			"src/Button.widget": "button content",
+		});
+		try {
+			const first = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
+			expect(resultText(first)).toContain("Widget body marker.");
+
+			await project.emit("session_compact", {});
+			const afterCompact = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
+			expect(resultText(afterCompact)).toContain("Widget body marker.");
 		} finally {
 			project.cleanup();
 		}
@@ -198,7 +213,7 @@ describe("globs auto-injection via arbitrary tools", () => {
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
 		});
 		try {
-			const result = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Missing.widget" }));
+			const result = await project.emit("tool_result", toolResult("mcp__fs__view", { file_path: "src/Missing.widget" }));
 			expect(result).toBeUndefined();
 		} finally {
 			project.cleanup();
@@ -211,7 +226,7 @@ describe("globs auto-injection via arbitrary tools", () => {
 			"src/Button.widget": "button content",
 		});
 		try {
-			const event = toolResult("exec_command", { command: "cat src/Button.widget" });
+			const event = toolResult("mcp__fs__view", { file_path: "src/Button.widget" });
 			event.isError = true;
 			const result = await project.emit("tool_result", event);
 			expect(result).toBeUndefined();
@@ -226,14 +241,14 @@ describe("globs auto-injection via arbitrary tools", () => {
 			"src/Button.widget": "button content",
 		});
 		try {
-			const result = await project.emit("tool_result", toolResult("exec_command", { command: "cat src/Button.widget" }));
+			const result = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
 			expect(result).toBeUndefined();
 		} finally {
 			project.cleanup();
 		}
 	});
 
-	it("trusts bare filename reads through the read tool but not through command tokens", async () => {
+	it("trusts bare filename reads through a path key but not through a command string", async () => {
 		const project = await setupProject({
 			".pi/skills/docker-tips/SKILL.md": `---
 name: docker-tips

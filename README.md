@@ -246,7 +246,7 @@ If the running session has more tokens than the target model's `contextWindow`, 
 
 ## Auto-injecting skills with `globs`
 
-Skills with a `globs` field in their frontmatter get injected when a tool touches a matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
+Skills with a `globs` field in their frontmatter get injected when a tool opens a matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
 
 ### Frontmatter format
 
@@ -280,9 +280,17 @@ globs: "Dockerfile*"
 ---
 ```
 
+### What counts as a trigger
+
+The trigger is a **structured path key** in the tool's input — `path`, `file`, `filepath`, `file_path`, `notebook_path`, or a `workdir`/`cwd`/`directory`/`dir` base key. Tool identity is not used, so a replaced or wrapped read tool (MCP file tools, wrapped editors) keeps working. Relative values resolve against the record's own `workdir`/`cwd` when one is present, otherwise against the session cwd. The candidate must exist on disk.
+
+Free-form strings are **not** scanned. A `bash` command such as `ls -la src/Button.tsx`, `grep -c . src/Button.tsx`, or `git log -- src/Button.tsx` names a path it never puts in context, so it does not inject.
+
 ### Deduplication
 
-Skills inject once per turn, not once per file. If you read three `.tsx` files in one turn, matching skills inject on the first read only.
+Skills inject **once per session**, not once per file or once per turn. A modified tool result is persisted in session history, so a second copy would only duplicate what the model already has. Compaction can summarize those bodies out of context; after a compaction the skill can inject again.
+
+This is the same set that governs backticked skill references, so a skill body loaded by either route suppresses the other.
 
 ### Supported glob patterns
 

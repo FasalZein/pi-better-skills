@@ -607,10 +607,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skillList: SkillRecord[] = [];
 	let cachedPackageRoots: string[] | undefined;
 	let activeSkill: SkillRecord | undefined;
-	// Tracks skills auto-injected via globs in the current turn (deduplication).
-	let injectedThisTurn = new Set<string>();
-	// Tracks skills whose full body is already in context this session, so the
-	// same backticked reference is never expanded twice. Cleared on compaction.
+	// Tracks skills whose full body is already in context this session, so neither
+	// a backticked reference nor globs auto-injection repeats one. A modified tool
+	// result is persisted in session history, so a second copy is pure duplication.
+	// Cleared on compaction, which can summarize those bodies back out of context.
 	let injectedSkillNames = new Set<string>();
 
 	function refDeps(cwd: string): RefDeps {
@@ -1030,10 +1030,6 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		return { action: "transform" as const, text };
 	});
 
-	pi.on("turn_start", async () => {
-		injectedThisTurn.clear();
-	});
-
 	pi.on("resources_discover", async (_event, ctx) => {
 		refreshSkills(ctx.cwd, undefined, ctx.isProjectTrusted());
 		return piDocsSkillRegistration(ctx.getSystemPrompt());
@@ -1156,19 +1152,20 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		}
 
 		// Phase 2: Find skills whose globs match a path named by the tool input
-		// (globs-based auto-injection). The trigger is generic path extraction over
-		// any tool's input — keyed on location-naming, not tool identity — so
-		// sessions whose read/bash tools were replaced or wrapped by another
-		// extension keep glob injection working. Candidates must exist on disk;
-		// bare tokens without a separator or extension only count when a
-		// structured path key (path, file_path, ...) names them.
+		// (globs-based auto-injection). The trigger is a structured path key in any
+		// tool's input — keyed on location-naming, not tool identity — so sessions
+		// whose read tool was replaced or wrapped by another extension keep glob
+		// injection working. Free-form strings such as shell commands are not
+		// scanned: a command line mentions paths it never opens. Candidates must
+		// exist on disk.
 		const toInject: SkillRecord[] = [];
 		const candidatePaths = extractPathCandidates(event.input, ctx.cwd).filter((candidate) => existsSync(candidate));
 		for (const s of skills.values()) {
 			if (!hasAutoInjectableGlobs(s)) continue;
 			if (skill && skill.name === s.name) continue;
-			// Per-turn deduplication: don't re-inject skills already loaded this turn
-			if (injectedThisTurn.has(s.name)) continue;
+			// Session-scoped deduplication: the body stays in the transcript, so a
+			// skill already in context is never injected a second time.
+			if (injectedSkillNames.has(s.name)) continue;
 			if (candidatePaths.some((candidate) => matchesGlobs(candidate, s.globs!))) {
 				toInject.push(s);
 			}
@@ -1201,7 +1198,6 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 					type: "text",
 					text: injectedText,
 				});
-				injectedThisTurn.add(injSkill.name);
 				injectedSkillNames.add(injSkill.name);
 				changed = true;
 			} catch {
@@ -1262,7 +1258,6 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// The counter handles sequential skill reads within one agent loop: each valid override
 	// increments; agent_end restores only when the counter drops back to zero.
 	pi.on("agent_end", async (_event, ctx) => {
-		injectedThisTurn.clear();
 		await restoreOriginalState(ctx);
 	});
 }

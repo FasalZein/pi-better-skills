@@ -2,10 +2,15 @@ import { resolve } from "node:path";
 
 /**
  * Generic, tool-agnostic extraction of filesystem path candidates from
- * arbitrary tool input. Tools that touch the filesystem must name a location
- * somewhere in their input; keying on location-naming instead of tool identity
- * keeps globs auto-injection working under any tool replacement (MCP
- * exec-style tools, wrapped editors, ...).
+ * arbitrary tool input. Only structured path-naming keys count: a tool that
+ * opens a file names it in a dedicated key (`path`, `file_path`, ...), so
+ * keying on those instead of tool identity keeps globs auto-injection working
+ * under any tool replacement (MCP file tools, wrapped editors, ...).
+ *
+ * Free-form strings such as shell commands are deliberately not scanned. A
+ * command line mentions paths it never opens (`ls`, `git log -- file`, `rm`),
+ * and treating a mention as a file visit made auto-injection fire on commands
+ * that put no file content in context.
  */
 
 const PATH_KEYS = new Set([
@@ -24,11 +29,7 @@ const PATH_KEYS = new Set([
 const BASE_KEYS = new Set(["workdir", "cwd", "directory", "dir"]);
 
 const MAX_DEPTH = 2;
-const MAX_STRING_SCAN = 16 * 1024;
 const MAX_CANDIDATES = 16;
-const LINE_SUFFIX = /:[0-9]+(?:[-,][0-9]+)*$/;
-const HAS_SEPARATOR = /[\\/]/;
-const HAS_EXTENSION = /\.[A-Za-z0-9]{1,8}$/;
 
 type CandidateAdder = (raw: string, base: string) => void;
 
@@ -38,25 +39,6 @@ function cleanValue(raw: string) {
 		.replace(/^['"`]|['"`]$/g, "")
 		.replace(/[,;:]+$/, "")
 		.trim();
-}
-
-function tokenCandidate(raw: string): string | undefined {
-	let cleaned = cleanValue(raw);
-	if (!cleaned) return undefined;
-	if (cleaned.startsWith("-") || cleaned.includes("://")) return undefined;
-	cleaned = cleaned.replace(LINE_SUFFIX, "");
-	// Bare tokens without a separator or extension (e.g. `Dockerfile`) are too
-	// ambiguous to trust from free-form strings; structured path keys still pass.
-	if (!HAS_SEPARATOR.test(cleaned) && !HAS_EXTENSION.test(cleaned)) return undefined;
-	return cleaned;
-}
-
-function scanTokens(raw: string, base: string, addCandidate: CandidateAdder) {
-	if (raw.length > MAX_STRING_SCAN) return;
-	for (const token of raw.split(/\s+/)) {
-		const candidate = tokenCandidate(token);
-		if (candidate) addCandidate(candidate, base);
-	}
 }
 
 function resolveRecordBase(entries: Array<[string, unknown]>, base: string, addCandidate: CandidateAdder) {
@@ -80,7 +62,6 @@ function walkEntries(entries: Array<[string, unknown]>, depth: number, recordBas
 		if (typeof child === "string") {
 			// BASE_KEYS values were already added as candidates while resolving recordBase.
 			if (PATH_KEYS.has(normalizedKey) && !BASE_KEYS.has(normalizedKey)) addCandidate(child, recordBase);
-			else scanTokens(child, recordBase, addCandidate);
 		} else {
 			walkValue(child, depth + 1, recordBase, addCandidate);
 		}
