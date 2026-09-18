@@ -241,6 +241,38 @@ describe("globs auto-injection via arbitrary tools", () => {
 		}
 	});
 
+	it("prepends a body once when one matching skill references another", async () => {
+		const project = await setupProject({
+			".pi/skills/a-parent/SKILL.md": `---
+name: a-parent
+description: Parent conventions
+globs: ["**/*.widget"]
+---
+
+Parent body. See \`/b-child\` for details.
+`,
+			".pi/skills/b-child/SKILL.md": `---
+name: b-child
+description: Child conventions
+globs: ["**/*.widget"]
+---
+
+Child body marker.
+`,
+			"src/Button.widget": "button content",
+		});
+		try {
+			const result = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
+			const text = resultText(result);
+			expect(text).toContain("Parent body.");
+			// The child matches the glob and is also a backticked reference of the
+			// parent. It must arrive once, not once per route.
+			expect(text.split("Child body marker.").length - 1).toBe(1);
+		} finally {
+			project.cleanup();
+		}
+	});
+
 	it("requires candidates to exist on disk", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,

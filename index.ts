@@ -1193,6 +1193,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 		// Prepend injected skill content (skills whose globs matched a tool-input path)
 		for (const injSkill of toInject) {
+			// An earlier iteration may have appended this skill as a backticked child
+			// of another match. toInject was fixed before the loop, so re-check here.
+			if (injectedSkillNames.has(injSkill.name)) continue;
 			try {
 				const rawContent = readFileSync(injSkill.filePath, "utf-8");
 				// Passive injection: collect backticked references, add path context,
