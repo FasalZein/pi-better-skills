@@ -246,7 +246,7 @@ If the running session has more tokens than the target model's `contextWindow`, 
 
 ## Auto-injecting skills with `globs`
 
-Skills with a `globs` field in their frontmatter get injected when a successful tool call names an existing matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
+Skills with a `globs` field in their frontmatter get injected when a tool call names a matching file, whatever the tool. You don't need to load the skill manually.
 
 ### Frontmatter format
 
@@ -280,21 +280,9 @@ globs: "Dockerfile*"
 ---
 ```
 
-### What counts as a trigger
-
-The extension keeps v1.3.2's broad, tool-independent path detection. Structured keys such as `path`, `file_path`, and `paths` participate, as do path-looking words in commands and notebook code. Quoted paths in expressions such as `Deno.readTextFile("src/App.tsx")` also participate. Relative paths resolve against a record's `workdir`/`cwd`/`directory`/`dir` base when present, otherwise against the session cwd. Candidates must exist on the local filesystem.
-
-A path mention is not proof that a file was read. Commands such as `ls src/App.tsx` and `git log -- src/App.tsx`, and write tools, can trigger a skill too. This is intentional compatibility behavior; deduplication prevents those mentions from repeatedly adding the same body. Bare names without a separator or extension, such as `Dockerfile`, require a structured path key.
-
-Scanning is bounded: at most 16 candidates, two nested record levels, 512 entries, and 65,536 characters of free-form text per input. Individual strings longer than 16,384 characters are skipped. These limits avoid unbounded scanning of large tool inputs.
-
-No changes to other extensions are required. Detection is best effort, not a guarantee for every tool: paths hidden in stored variables, computed by code, accessible only on a remote machine, or outside the scan limits cannot be inferred reliably. The extension does not execute input to discover paths. Notebook wrappers expose only the outer call; paths inside its visible code can trigger, but a later polling result with only a job/cell ID provides no new path information. Ordinary skill selection and explicit `/skill:name` commands remain available independently of these file-pattern triggers.
-
 ### Deduplication
 
-Automatic injection skips skills whose complete bodies are already confirmed in the active conversation. This applies across turns and is shared with backticked skill references and delivered `/skill:name` messages. Partial reads and intercepted commands do not count as complete delivery. A later extension that removes or truncates an injected body must not mark that body as delivered.
-
-Session loading, tree navigation, and compaction rebuild this tracking from the active history. If the body is gone, it can inject again; retained complete bodies stay deduplicated. Explicit user requests can still load a skill again. Dynamically transformed bodies that cannot be confirmed from stored text can be repeated conservatively rather than suppressing instructions that may be missing.
+A skill injects once while its body is in the conversation. If compaction or tree navigation removes it, it can inject again.
 
 ### Supported glob patterns
 
@@ -353,7 +341,7 @@ References expand wherever a skill body enters context:
 
 - **Transitive, cycle-safe.** References of references expand too. One expansion never injects the same skill twice (diamonds collapse).
 - **Referenced skills can set `disable-model-invocation: true`.** Unlike passive `globs` injection, a backticked reference is an explicit author choice, so those skills inject anyway.
-- **Active-context deduplication.** A referenced skill is not added again while its complete body remains in the active conversation. After compaction or tree navigation, only bodies no longer present become eligible for injection again.
+- **No duplicates.** A referenced skill injects once while its body is in the context; compaction or tree navigation can make it eligible again.
 - **Unresolvable references inject nothing.** `` `/typo` `` stays as written and no block is appended when the name does not match an installed skill.
 - **Dynamic shell placeholders never run in referenced bodies.** The extension neutralizes them with a visible note. This keeps the promise that loaded content already contains command output.
 - **No model/thinking overrides from referenced skills.** Frontmatter `model`/`thinking` only apply to the skill you explicitly load.
