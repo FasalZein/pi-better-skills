@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { type Dirent, existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -231,6 +231,9 @@ function renderInlineSkillDisplay(skill: InlineSkillDisplay, expanded: boolean):
 		name: skill.name,
 		location: skill.filePath,
 		content: skill.content,
+		// The component renders the skill block only; pi renders the user message
+		// separately, so the block carries no user message of its own.
+		userMessage: undefined,
 	});
 	component.setExpanded(expanded);
 	return component;
@@ -491,7 +494,9 @@ export function extractInlineSkillDisplays(
 function scanSkillRoots(roots: string[]): SkillRecord[] {
 	const out: SkillRecord[] = [];
 	const visit = (dir: string) => {
-		let entries: ReturnType<typeof readdirSync>;
+		// Not ReturnType<typeof readdirSync>: that resolves the last overload
+		// (Dirent<Buffer>[]), not the withFileTypes form actually called here.
+		let entries: Dirent[];
 		try {
 			entries = readdirSync(dir, { withFileTypes: true });
 		} catch {
