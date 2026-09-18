@@ -16,6 +16,35 @@ describe("extractPathCandidates (structured keys)", () => {
 	it("ignores non-string and empty values", () => {
 		expect(extractPathCandidates({ path: 7, filePath: "", nested: { path: null } }, "/repo")).toEqual([]);
 	});
+
+	it("reads every entry of a list-valued path key", () => {
+		// MCP read_multiple_files and friends pass a list, not a single string.
+		expect(extractPathCandidates({ paths: ["src/App.tsx", "src/Other.tsx"] }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+			resolve("/repo/src/Other.tsx"),
+		]);
+		expect(extractPathCandidates({ files: ["a.css"], file_paths: ["b.css"] }, "/repo")).toEqual([
+			resolve("/repo/a.css"),
+			resolve("/repo/b.css"),
+		]);
+	});
+
+	it("resolves a list-valued path key against a workdir base key", () => {
+		expect(extractPathCandidates({ workdir: "src", paths: ["App.tsx"] }, "/repo")).toEqual([
+			resolve("/repo/src"),
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+
+	it("skips non-string entries inside a list-valued path key", () => {
+		expect(extractPathCandidates({ paths: [7, null, "src/App.tsx", { path: "nested.tsx" }] }, "/repo")).toEqual([
+			resolve("/repo/src/App.tsx"),
+		]);
+	});
+
+	it("does not treat a list under a non-path key as paths", () => {
+		expect(extractPathCandidates({ args: ["src/App.tsx"] }, "/repo")).toEqual([]);
+	});
 });
 
 describe("extractPathCandidates (free-form strings)", () => {

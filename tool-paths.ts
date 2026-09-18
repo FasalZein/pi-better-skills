@@ -24,6 +24,13 @@ const PATH_KEYS = new Set([
 	"dir",
 	"notebookpath",
 	"notebook_path",
+	// Plural forms carry a list, as in the MCP `read_multiple_files` shape.
+	"paths",
+	"files",
+	"filepaths",
+	"file_paths",
+	"notebookpaths",
+	"notebook_paths",
 ]);
 
 const BASE_KEYS = new Set(["workdir", "cwd", "directory", "dir"]);
@@ -59,9 +66,13 @@ function resolveRecordBase(entries: Array<[string, unknown]>, base: string, addC
 function walkEntries(entries: Array<[string, unknown]>, depth: number, recordBase: string, addCandidate: CandidateAdder) {
 	for (const [key, child] of entries) {
 		const normalizedKey = key.toLowerCase();
+		// BASE_KEYS values were already added as candidates while resolving recordBase.
+		const isPathKey = PATH_KEYS.has(normalizedKey) && !BASE_KEYS.has(normalizedKey);
 		if (typeof child === "string") {
-			// BASE_KEYS values were already added as candidates while resolving recordBase.
-			if (PATH_KEYS.has(normalizedKey) && !BASE_KEYS.has(normalizedKey)) addCandidate(child, recordBase);
+			if (isPathKey) addCandidate(child, recordBase);
+		} else if (isPathKey && Array.isArray(child)) {
+			// A path key may hold a list of locations; its elements are paths, not a record.
+			for (const item of child) if (typeof item === "string") addCandidate(item, recordBase);
 		} else {
 			walkValue(child, depth + 1, recordBase, addCandidate);
 		}
