@@ -1016,7 +1016,12 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (!result) return;
 		if (isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) {
 			// No resolvable references -> keep pi core's ordinary single-skill expansion.
-			if (!hasResolvableReference(result.skills[0].content, (name) => skills.get(name))) return;
+			// Core still puts the body in context, so record it: globs auto-injection
+			// must not pay for a second copy of a skill the user just loaded by hand.
+			if (!hasResolvableReference(result.skills[0].content, (name) => skills.get(name))) {
+				injectedSkillNames.add(result.skills[0].name);
+				return;
+			}
 		}
 
 		const batch = commitRefExpansion(result.skills, refDeps(ctx.cwd), injectedSkillNames);

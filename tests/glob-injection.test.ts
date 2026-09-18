@@ -208,6 +208,39 @@ describe("globs auto-injection via arbitrary tools", () => {
 		}
 	});
 
+	it("injects from a list-valued path key", async () => {
+		const project = await setupProject({
+			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
+			"src/Button.widget": "button content",
+		});
+		try {
+			const result = await project.emit(
+				"tool_result",
+				toolResult("mcp__fs__read_multiple_files", { paths: ["README.md", "src/Button.widget"] }),
+			);
+			expect(resultText(result)).toContain("Widget body marker.");
+		} finally {
+			project.cleanup();
+		}
+	});
+
+	it("does not inject a skill the user already loaded with /skill:name", async () => {
+		const project = await setupProject({
+			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
+			"src/Button.widget": "button content",
+		});
+		try {
+			// pi core expands an ordinary leading `/skill:name` itself, so the body is
+			// in context even though this extension declines to rewrite the prompt.
+			await project.emit("input", { source: "user", text: "/skill:widget-patterns build the button" });
+
+			const result = await project.emit("tool_result", toolResult("read", { path: "src/Button.widget" }));
+			expect(result).toBeUndefined();
+		} finally {
+			project.cleanup();
+		}
+	});
+
 	it("requires candidates to exist on disk", async () => {
 		const project = await setupProject({
 			".pi/skills/widget-patterns/SKILL.md": WIDGET_SKILL,
