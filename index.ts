@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { SkillInvocationMessageComponent, stripFrontmatter } from "@earendil-works/pi-coding-agent";
+import { SkillInvocationMessageComponent, buildSessionContext, stripFrontmatter } from "@earendil-works/pi-coding-agent";
 import { Container, Spacer } from "@earendil-works/pi-tui";
 import { applyPiDocsStrip, piDocsSkillRegistration } from "./pi-docs";
 import {
@@ -167,10 +167,20 @@ export function projectSkillRoots(cwd: string, trusted: boolean): string[] {
 
 /** True when the tool result text actually contains the skill's body opening. */
 export function resultConfirmsSkillBody(resultText: string, skillBody: string): boolean {
-	const collapse = (s: string) => s.replace(/\s+/g, " ").trim();
-	const body = collapse(skillBody);
+	const body = normalizeSkillText(skillBody);
 	if (!body) return false;
-	return collapse(resultText).includes(body.slice(0, 80));
+	return normalizeSkillText(resultText).includes(body.slice(0, 80));
+}
+
+/** True when the result contains the complete normalized skill body. */
+function resultConfirmsFullSkillBody(resultText: string, skillBody: string): boolean {
+	const body = normalizeSkillText(skillBody);
+	if (!body) return false;
+	return normalizeSkillText(resultText).includes(body);
+}
+
+function normalizeSkillText(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -612,11 +622,56 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	let skillList: SkillRecord[] = [];
 	let cachedPackageRoots: string[] | undefined;
 	let activeSkill: SkillRecord | undefined;
-	// Tracks skills whose full body is already in context this session, so neither
-	// a backticked reference nor globs auto-injection repeats one. A modified tool
-	// result is persisted in session history, so a second copy is pure duplication.
-	// Cleared on compaction, which can summarize those bodies back out of context.
+	// Residency is a cache of the active persisted session context. Reservations
+	// only cover tool results that are still in flight, so parallel results do
+	// not append the same body before their messages reach session history.
 	let injectedSkillNames = new Set<string>();
+	let reservedSkillNames = new Set<string>();
+	let reservationsByToolCall = new Map<string, Set<string>>();
+	let reconciledSessionId: string | undefined;
+	let reconciledLeafId: string | null | undefined;
+	let reconciledSkills: Map<string, SkillRecord> | undefined;
+	let sessionInitialized = false;
+
+	function hasKnownSkill(name: string): boolean {
+		return injectedSkillNames.has(name) || reservedSkillNames.has(name);
+	}
+
+	function reserveSkill(name: string): boolean {
+		if (hasKnownSkill(name)) return false;
+		reservedSkillNames.add(name);
+		return true;
+	}
+
+	function releaseSkills(names: Iterable<string>): void {
+		for (const name of names) reservedSkillNames.delete(name);
+	}
+
+	function releaseAllReservations(): void {
+		for (const names of reservationsByToolCall.values()) releaseSkills(names);
+		reservationsByToolCall = new Map();
+		reservedSkillNames = new Set();
+	}
+
+	function releaseToolCallReservations(toolCallId: string): void {
+		const names = reservationsByToolCall.get(toolCallId);
+		if (!names) return;
+		reservationsByToolCall.delete(toolCallId);
+		releaseSkills(names);
+	}
+
+	function invalidateResidencyCache(): void {
+		reconciledSessionId = undefined;
+		reconciledLeafId = undefined;
+		reconciledSkills = undefined;
+	}
+
+	function clearResidency(): void {
+		releaseAllReservations();
+		injectedSkillNames = new Set();
+		activeSkill = undefined;
+		invalidateResidencyCache();
+	}
 
 	function refDeps(cwd: string): RefDeps {
 		return {
@@ -624,15 +679,9 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			// referenceable — referencing a sibling from a loaded skill is an
 			// explicit author choice, unlike passive globs auto-injection.
 			resolve: (name) => skills.get(name),
-			readBody(skill) {
-				try {
-					return stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
-				} catch {
-					return undefined;
-				}
-			},
+			readBody: (skill) => readSkillBody(skill),
 			decorate: (body, skill) => insertSkillContext(body, skill, cwd),
-			alreadyInjected: (name) => injectedSkillNames.has(name),
+			alreadyInjected: (name) => hasKnownSkill(name),
 		};
 	}
 
@@ -742,6 +791,22 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// Skill discovery
 	// ---------------------------------------------------------------------------
 
+	function sameSkillRecords(left: SkillRecord, right: SkillRecord): boolean {
+		if (left.filePath !== right.filePath || left.baseDir !== right.baseDir) return false;
+		if (left.disableModelInvocation !== right.disableModelInvocation) return false;
+		if (left.globs?.length !== right.globs?.length) return false;
+		return (left.globs ?? []).every((glob, index) => glob === right.globs?.[index]);
+	}
+
+	function sameSkillMaps(left: Map<string, SkillRecord>, right: Map<string, SkillRecord>): boolean {
+		if (left.size !== right.size) return false;
+		for (const [name, skill] of left) {
+			const next = right.get(name);
+			if (!next || !sameSkillRecords(skill, next)) return false;
+		}
+		return true;
+	}
+
 	function refreshSkills(cwd: string, loaded?: unknown[], trusted = false) {
 		const next = new Map<string, SkillRecord>();
 		for (const skill of loaded ?? []) {
@@ -787,8 +852,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				next.set(skill.name, skill);
 			}
 		}
+		if (sameSkillMaps(skills, next)) return;
 		skills = next;
 		skillList = Array.from(next.values());
+		invalidateResidencyCache();
 	}
 
 	function isTrustedForDynamicShell(skill: SkillRecord): boolean {
@@ -893,17 +960,86 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	 * enrichment or mark the skill injected.
 	 */
 	function confirmedSkillRead(event: { content: Array<{ type: string; text?: string }> }, skill: SkillRecord): boolean {
-		let body: string;
-		try {
-			body = stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
-		} catch {
-			return false;
-		}
-		const text = event.content
-			.filter((block) => block.type === "text" && typeof block.text === "string")
-			.map((block) => block.text)
-			.join("\n");
+		const body = readSkillBody(skill);
+		if (!body) return false;
+		const text = contentText(event.content);
 		return resultConfirmsSkillBody(text, body);
+	}
+
+	function readSkillBody(skill: SkillRecord): string | undefined {
+		try {
+			return stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim();
+		} catch {
+			return undefined;
+		}
+	}
+
+	type TextBearingContent = { type: string; text?: string };
+
+	function contentText(content: string | readonly TextBearingContent[]): string {
+		if (typeof content === "string") return content;
+		return content
+			.filter((block) => block.type === "text" && typeof block.text === "string")
+			.map((block) => block.text ?? "")
+			.join("\n");
+	}
+
+	type SessionContextMessage = ReturnType<typeof buildSessionContext>["messages"][number];
+
+	function sessionMessageText(message: SessionContextMessage): string {
+		if (message.role === "toolResult" && message.isError) return "";
+		if ("content" in message) return contentText(message.content);
+		if ("summary" in message) return message.summary;
+		return "";
+	}
+
+
+	function reconcileResidency(ctx: ExtensionContext, resetTransient = false): void {
+		const sessionId = ctx.sessionManager.getSessionId();
+		const leafId = ctx.sessionManager.getLeafId();
+		const unchanged =
+			!resetTransient &&
+			reconciledSessionId === sessionId &&
+			reconciledLeafId === leafId &&
+			reconciledSkills === skills;
+		if (unchanged) return;
+
+		if (resetTransient) {
+			releaseAllReservations();
+			activeSkill = undefined;
+		}
+
+		const context = buildSessionContext(ctx.sessionManager.getBranch(), leafId);
+		// Only persisted results end reservations. A message_end handler can await
+		// or replace content, so releasing inside that chain reopens a parallel race.
+		for (const message of context.messages) {
+			if (message.role === "toolResult") releaseToolCallReservations(message.toolCallId);
+		}
+		const contextText = normalizeSkillText(context.messages.map(sessionMessageText).filter(Boolean).join("\n"));
+
+		const next = new Set<string>();
+		for (const skill of skills.values()) {
+			const body = readSkillBody(skill);
+			if (!body) continue;
+			const normalizedBody = normalizeSkillText(body);
+			if (!normalizedBody) continue;
+			if (contextText.includes(normalizedBody)) {
+				next.add(skill.name);
+				continue;
+			}
+			const passiveBody = normalizeSkillText(neutralizeDynamicPlaceholders(body));
+			if (contextText.includes(passiveBody)) next.add(skill.name);
+		}
+
+		injectedSkillNames = next;
+		reconciledSessionId = sessionId;
+		reconciledLeafId = leafId;
+		reconciledSkills = skills;
+	}
+
+	function confirmedCompleteSkillRead(event: { content: Array<{ type: string; text?: string }> }, skill: SkillRecord): boolean {
+		const body = readSkillBody(skill);
+		return body ? resultConfirmsFullSkillBody(contentText(event.content), body) : false;
 	}
 
 	function rewriteCommand(command: string, cwd: string): string {
@@ -989,15 +1125,34 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.registerMessageRenderer("skill", renderInlineSkillBatch as any);
 
 	pi.on("session_start", async (_event, ctx) => {
-		injectedSkillNames = new Set();
+		sessionInitialized = true;
+		clearResidency();
 		refreshSkills(ctx.cwd, undefined, ctx.isProjectTrusted());
+		reconcileResidency(ctx);
 		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => skillList);
 	});
 
-	// Compaction can summarize previously injected skill bodies out of context;
-	// allow references to expand again afterwards.
-	pi.on("session_compact", async () => {
-		injectedSkillNames = new Set();
+	pi.on("session_compact", async (_event, ctx) => {
+		// Rebuild from the active branch: retained recent messages may still contain
+		// a body, while summarized messages no longer do.
+		reconcileResidency(ctx, true);
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		// Tree navigation can move away from a tool result that supplied a body.
+		reconcileResidency(ctx, true);
+	});
+
+	pi.on("session_shutdown", async () => {
+		sessionInitialized = false;
+		clearResidency();
+	});
+
+
+	pi.on("turn_end", async (_event, ctx) => {
+		if (!sessionInitialized) return;
+		reconcileResidency(ctx);
+		releaseAllReservations();
 	});
 
 	// Multi-skill prompts are handled entirely by the extension so both the TUI
@@ -1021,15 +1176,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (!result) return;
 		if (isOrdinarySingleLeadingSkillCommand(event.text, result.skills)) {
 			// No resolvable references -> keep pi core's ordinary single-skill expansion.
-			// Core still puts the body in context, so record it: globs auto-injection
-			// must not pay for a second copy of a skill the user just loaded by hand.
 			if (!hasResolvableReference(result.skills[0].content, (name) => skills.get(name))) {
-				injectedSkillNames.add(result.skills[0].name);
 				return;
 			}
 		}
 
-		const batch = commitRefExpansion(result.skills, refDeps(ctx.cwd), injectedSkillNames);
+		// This local set prevents duplicate references within the transformed
+		// prompt without claiming that the prompt was actually delivered.
+		const stagedSkillNames = new Set([...injectedSkillNames, ...reservedSkillNames]);
+		const batch = commitRefExpansion(result.skills, refDeps(ctx.cwd), stagedSkillNames);
 
 		const { text, messages } = planInlineSkillDelivery({ text: result.text, skills: batch }, Boolean(event.streamingBehavior));
 		const options = event.streamingBehavior ? { deliverAs: event.streamingBehavior } : undefined;
@@ -1048,6 +1203,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		const loaded = Array.isArray(event.systemPromptOptions?.skills) ? event.systemPromptOptions.skills : undefined;
 		refreshSkills(ctx.cwd, loaded, ctx.isProjectTrusted());
+		if (sessionInitialized) reconcileResidency(ctx);
 
 		let basePrompt = event.systemPrompt;
 		const strippedPrompt = applyPiDocsStrip(basePrompt, {
@@ -1130,18 +1286,29 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
-		if (event.isError) return;
+		if (sessionInitialized) reconcileResidency(ctx);
+		const claimedByThisResult = new Set<string>();
+		let reservationsStored = false;
+
+		try {
+			if (event.isError) {
+				releaseToolCallReservations(event.toolCallId);
+				return;
+			}
 
 		// Phase 1: Identify the directly targeted skill (SKILL.md read / bash referencing SKILL.md)
 		let skill: SkillRecord | undefined;
+		let skillBodyComplete = false;
 
 		if (event.toolName === "read") {
 			const inputPath = typeof event.input.path === "string" ? event.input.path : undefined;
 			if (inputPath) skill = findSkillForPath(inputPath);
+			if (skill) skillBodyComplete = confirmedCompleteSkillRead(event, skill);
 		} else if (event.toolName === "bash") {
 			const command = typeof event.input.command === "string" ? event.input.command : undefined;
 			if (command) skill = findSkillReferencedByCommand(command, ctx.cwd);
 			if (skill && !confirmedSkillRead(event, skill)) return;
+			if (skill) skillBodyComplete = confirmedCompleteSkillRead(event, skill);
 		} else {
 			// Tool-agnostic skill detection: any tool (e.g. an MCP `exec_command`)
 			// whose input strings reference a known SKILL.md path counts as a
@@ -1159,23 +1326,22 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				}
 			}
 			if (skill && !confirmedSkillRead(event, skill)) return;
+			if (skill) skillBodyComplete = confirmedCompleteSkillRead(event, skill);
 		}
 
-		// Phase 2: Find skills whose globs match a path named by the tool input
-		// (globs-based auto-injection). The trigger is a structured path key in any
-		// tool's input — keyed on location-naming, not tool identity — so sessions
-		// whose read tool was replaced or wrapped by another extension keep glob
-		// injection working. Free-form strings such as shell commands are not
-		// scanned: a command line mentions paths it never opens. Candidates must
-		// exist on disk.
+		// Phase 2: Find skills whose globs match a path named by arbitrary tool
+		// input. Bounded extraction keeps this tool-agnostic: structured location
+		// keys, lists, bases, and path-looking strings can all trigger a match, so
+		// wrapped file tools and shell/notebook tools keep the same behavior.
+		// Candidates must exist on disk.
 		const toInject: SkillRecord[] = [];
 		const candidatePaths = extractPathCandidates(event.input, ctx.cwd).filter((candidate) => existsSync(candidate));
 		for (const s of skills.values()) {
 			if (!hasAutoInjectableGlobs(s)) continue;
-			if (skill && skill.name === s.name) continue;
+			if (skill && skillBodyComplete && skill.name === s.name) continue;
 			// Session-scoped deduplication: the body stays in the transcript, so a
 			// skill already in context is never injected a second time.
-			if (injectedSkillNames.has(s.name)) continue;
+			if (hasKnownSkill(s.name)) continue;
 			if (candidatePaths.some((candidate) => matchesGlobs(candidate, s.globs!))) {
 				toInject.push(s);
 			}
@@ -1190,12 +1356,23 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 		// Start with the original content blocks
 		const allBlocks: any[] = [...event.content];
+		const completedByThisResult = new Set<string>();
+		const claimForResult = (name: string): boolean => {
+			if (!reserveSkill(name)) return false;
+			claimedByThisResult.add(name);
+			return true;
+		};
+
+		if (skill && skillBodyComplete && claimForResult(skill.name)) {
+			completedByThisResult.add(skill.name);
+		}
 
 		// Prepend injected skill content (skills whose globs matched a tool-input path)
 		for (const injSkill of toInject) {
 			// An earlier iteration may have appended this skill as a backticked child
 			// of another match. toInject was fixed before the loop, so re-check here.
-			if (injectedSkillNames.has(injSkill.name)) continue;
+			if (!claimForResult(injSkill.name)) continue;
+			const injectionClaims = new Set([injSkill.name]);
 			try {
 				const rawContent = readFileSync(injSkill.filePath, "utf-8");
 				// Passive injection: collect backticked references, add path context,
@@ -1204,16 +1381,20 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 				const refs = collectSkillReferences(injSkill.name, rawContent, refDeps(ctx.cwd));
 				let injectedText = neutralizeDynamicPlaceholders(insertSkillContext(rawContent, injSkill, ctx.cwd));
 				for (const ref of refs) {
-					injectedSkillNames.add(ref.skill.name);
-					injectedText += `\n\n<skill name="${ref.skill.name}" location="${ref.skill.filePath}">\n${ref.decoratedBody}\n</skill>`;
+					if (!claimForResult(ref.skill.name)) continue;
+					injectionClaims.add(ref.skill.name);
+					completedByThisResult.add(ref.skill.name);
+					injectedText += "\n\n<skill name=\"" + ref.skill.name + "\" location=\"" + ref.skill.filePath + "\">\n" + ref.decoratedBody + "\n</skill>";
 				}
 				allBlocks.unshift({
 					type: "text",
 					text: injectedText,
 				});
-				injectedSkillNames.add(injSkill.name);
+				completedByThisResult.add(injSkill.name);
 				changed = true;
 			} catch {
+				releaseSkills(injectionClaims);
+				for (const name of injectionClaims) completedByThisResult.delete(name);
 				// Silently skip unreadable skills
 			}
 		}
@@ -1232,13 +1413,14 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 					const fields = extractFrontmatterFields(text);
 					if (fields.model || fields.thinking) frontmatterFields = fields;
 					text = insertSkillContext(text, skill, ctx.cwd);
-					// Collect backticked `/name` references synchronously BEFORE any
-					// await and reserve them in the session set: parallel tool_result
-					// handlers interleave at await points, and unreserved names would
-					// let both handlers append the same child.
-					mainRefs = collectSkillReferences(skill.name, text, refDeps(ctx.cwd));
-					for (const ref of mainRefs) injectedSkillNames.add(ref.skill.name);
-					injectedSkillNames.add(skill.name);
+					// Collect references and reserve their bodies before the first await;
+					// parallel tool results must not append the same child.
+					// Wrapped tools can put status text before the actual SKILL.md body.
+					// Collect from every original text block, not just the first block.
+					mainRefs = collectSkillReferences(skill.name, contentText(event.content), refDeps(ctx.cwd));
+					for (const ref of mainRefs) {
+						if (claimForResult(ref.skill.name)) completedByThisResult.add(ref.skill.name);
+					}
 					text = await executeDynamicShell(text, skill, ctx.cwd);
 				} else {
 					text = await executeDynamicShell(text, skill, ctx.cwd);
@@ -1264,13 +1446,23 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			void applySkillOverrides(frontmatterFields, ctx);
 		}
 
+		if (completedByThisResult.size > 0 && event.toolCallId) {
+			reservationsByToolCall.set(event.toolCallId, completedByThisResult);
+			reservationsStored = true;
+		}
+
 		if (changed) return { content };
+		} finally {
+			if (!reservationsStored) releaseSkills(claimedByThisResult);
+		}
 	});
 
 	// Restore original model/thinking when the agent finishes processing a user request.
 	// The counter handles sequential skill reads within one agent loop: each valid override
 	// increments; agent_end restores only when the counter drops back to zero.
 	pi.on("agent_end", async (_event, ctx) => {
+		if (sessionInitialized) reconcileResidency(ctx);
+		releaseAllReservations();
 		await restoreOriginalState(ctx);
 	});
 }

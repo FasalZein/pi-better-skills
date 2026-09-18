@@ -246,7 +246,7 @@ If the running session has more tokens than the target model's `contextWindow`, 
 
 ## Auto-injecting skills with `globs`
 
-Skills with a `globs` field in their frontmatter get injected when a tool opens a matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
+Skills with a `globs` field in their frontmatter get injected when a successful tool call names an existing matching file. You don't need to load the skill manually. The extension checks each skill's globs against file paths named by tool input, and prepends matching skill content to the result.
 
 ### Frontmatter format
 
@@ -282,15 +282,19 @@ globs: "Dockerfile*"
 
 ### What counts as a trigger
 
-The trigger is a **structured path key** in the tool's input — `path`, `file`, `filepath`, `file_path`, `notebook_path`, or a `workdir`/`cwd`/`directory`/`dir` base key. Tool identity is not used, so a replaced or wrapped read tool (MCP file tools, wrapped editors) keeps working. Relative values resolve against the record's own `workdir`/`cwd` when one is present, otherwise against the session cwd. The candidate must exist on disk.
+The extension keeps v1.3.2's broad, tool-independent path detection. Structured keys such as `path`, `file_path`, and `paths` participate, as do path-looking words in commands and notebook code. Quoted paths in expressions such as `Deno.readTextFile("src/App.tsx")` also participate. Relative paths resolve against a record's `workdir`/`cwd`/`directory`/`dir` base when present, otherwise against the session cwd. Candidates must exist on the local filesystem.
 
-Free-form strings are **not** scanned. A `bash` command such as `ls -la src/Button.tsx`, `grep -c . src/Button.tsx`, or `git log -- src/Button.tsx` names a path it never puts in context, so it does not inject.
+A path mention is not proof that a file was read. Commands such as `ls src/App.tsx` and `git log -- src/App.tsx`, and write tools, can trigger a skill too. This is intentional compatibility behavior; deduplication prevents those mentions from repeatedly adding the same body. Bare names without a separator or extension, such as `Dockerfile`, require a structured path key.
+
+Scanning is bounded: at most 16 candidates, two nested record levels, 512 entries, and 65,536 characters of free-form text per input. Individual strings longer than 16,384 characters are skipped. These limits avoid unbounded scanning of large tool inputs.
+
+No changes to other extensions are required. Detection is best effort, not a guarantee for every tool: paths hidden in stored variables, computed by code, accessible only on a remote machine, or outside the scan limits cannot be inferred reliably. The extension does not execute input to discover paths. Notebook wrappers expose only the outer call; paths inside its visible code can trigger, but a later polling result with only a job/cell ID provides no new path information. Ordinary skill selection and explicit `/skill:name` commands remain available independently of these file-pattern triggers.
 
 ### Deduplication
 
-Skills inject **once per session**, not once per file or once per turn. A modified tool result is persisted in session history, so a second copy would only duplicate what the model already has. Compaction can summarize those bodies out of context; after a compaction the skill can inject again.
+Automatic injection skips skills whose complete bodies are already confirmed in the active conversation. This applies across turns and is shared with backticked skill references and delivered `/skill:name` messages. Partial reads and intercepted commands do not count as complete delivery. A later extension that removes or truncates an injected body must not mark that body as delivered.
 
-This is the same set that governs backticked skill references, so a skill body loaded by either route suppresses the other.
+Session loading, tree navigation, and compaction rebuild this tracking from the active history. If the body is gone, it can inject again; retained complete bodies stay deduplicated. Explicit user requests can still load a skill again. Dynamically transformed bodies that cannot be confirmed from stored text can be repeated conservatively rather than suppressing instructions that may be missing.
 
 ### Supported glob patterns
 
@@ -349,7 +353,7 @@ References expand wherever a skill body enters context:
 
 - **Transitive, cycle-safe.** References of references expand too. One expansion never injects the same skill twice (diamonds collapse).
 - **Referenced skills can set `disable-model-invocation: true`.** Unlike passive `globs` injection, a backticked reference is an explicit author choice, so those skills inject anyway.
-- **Session-wide deduplication.** A referenced skill injects once per session. The memory resets after `/compact`, because compaction can remove the earlier body from the context.
+- **Active-context deduplication.** A referenced skill is not added again while its complete body remains in the active conversation. After compaction or tree navigation, only bodies no longer present become eligible for injection again.
 - **Unresolvable references inject nothing.** `` `/typo` `` stays as written and no block is appended when the name does not match an installed skill.
 - **Dynamic shell placeholders never run in referenced bodies.** The extension neutralizes them with a visible note. This keeps the promise that loaded content already contains command output.
 - **No model/thinking overrides from referenced skills.** Frontmatter `model`/`thinking` only apply to the skill you explicitly load.
