@@ -56,6 +56,15 @@ function detailsWithoutTruncation(details: unknown): Record<string, unknown> | u
 	return rest;
 }
 
+/**
+ * One line telling the model what the appended copy is and when to read the
+ * file itself. It appears once per skill per session, so it stays short.
+ */
+function firstLoadNote(bodyLine: number | undefined): string {
+	const frontmatter = bodyLine === undefined ? "" : `; frontmatter omitted, body line 1 = file line ${bodyLine}`;
+	return `First load: complete body${frontmatter}. Read the file only for exact contents, e.g. to edit this skill.`;
+}
+
 export type SkillFirstRead = ReturnType<typeof createSkillFirstRead>;
 
 export function createSkillFirstRead(catalog: SkillCatalog) {
@@ -118,18 +127,26 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 
 	/**
 	 * The body, not the file: loading a skill to use it needs the
-	 * instructions, as skill injectors deliver them. The note names the
-	 * omitted frontmatter so an agent editing the skill knows to read the file
-	 * (a later read is native). The block carries its own directory context:
-	 * a tool whose input never names the file is invisible to delivery.
+	 * instructions, as skill injectors deliver them. It rides in the same
+	 * <skill name location> tag as pi's own skill blocks, which names the file
+	 * even when the tool call did not, and lets residency see the body. The
+	 * block carries its own directory context: a tool whose input never names
+	 * the file is invisible to delivery.
 	 */
 	function completeBodyBlock(skill: SkillRecord, doc: SkillDocument, cwd: string): string {
-		const frontmatter = doc.raw.match(FRONTMATTER);
-		const omitted = frontmatter
-			? ` Its frontmatter (${frontmatter[0].trimEnd().split("\n").length} lines) is omitted; read the file to see it.`
-			: "";
-		const note = `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so its complete body follows.${omitted}]`;
-		return `${note}\n\n${skillContextBlock(skill, cwd)}\n\n${doc.body}`;
+		const hasFrontmatter = FRONTMATTER.test(doc.raw);
+		// 1-based file line of the body's first line, so line-based edits made
+		// from this copy can be mapped back to the file.
+		const bodyLine = doc.raw.slice(0, doc.raw.indexOf(doc.body)).split("\n").length;
+		return [
+			`<skill name="${skill.name}" location="${skill.filePath}">`,
+			firstLoadNote(hasFrontmatter ? bodyLine : undefined),
+			"",
+			skillContextBlock(skill, cwd),
+			"",
+			doc.body,
+			"</skill>",
+		].join("\n");
 	}
 
 	function readRaw(skill: SkillRecord): string | undefined {

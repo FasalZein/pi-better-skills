@@ -438,12 +438,29 @@ describe("tool-agnostic loads", () => {
 		// Body only: the frontmatter is named in the note, not repeated.
 		expect(added).not.toContain("name: long-guide");
 		expect(added).not.toContain("description:");
-		expect(added).toContain("frontmatter (4 lines) is omitted");
+		// The same skill tag pi and reference expansion use; the path rides as an attribute.
+		expect(added.startsWith(`<skill name="long-guide" location="${path}">\n`)).toBe(true);
+		expect(added.trimEnd().endsWith("</skill>")).toBe(true);
+		// Frontmatter: ---, name, description, --- and a blank line, so the body starts on line 6.
+		expect(added).toContain("body line 1 = file line 6");
 		expect(countOf(added, "<skill_context>")).toBe(1);
 		expect(added.indexOf("<skill_context>")).toBeLessThan(added.indexOf("# long-guide"));
 	});
 
-	it("omits the frontmatter note for a SKILL.md without frontmatter", async () => {
+	it("computes the body's file line from each skill's own frontmatter", async () => {
+		const settings = "model: zai/glm-5.3\nthinking: low\nglobs:\n  - '*.zorb'\n";
+		const skill = longSkill("long-guide", 400).replace("---\n\n#", `${settings}---\n\n\n#`);
+		const project = await setup({ [SKILL_REL]: skill });
+		const lines = readFileSync(join(project.root, SKILL_REL), "utf-8").split("\n");
+		const bodyLine = lines.indexOf("# long-guide") + 1;
+		expect(bodyLine).toBe(11);
+
+		const first = await project.run("bash", { command: `tail -n 40 ${SKILL_REL}` });
+
+		expect(first.content[1]!.text).toContain(`body line 1 = file line ${bodyLine}`);
+	});
+
+	it("leaves out the frontmatter clause for a SKILL.md without frontmatter", async () => {
 		const plain = longSkill("plain", 400).replace(/^---[\s\S]*?---\n/, "");
 		const project = await setup({ "notes/plain/SKILL.md": plain });
 		const path = join(project.root, "notes/plain/SKILL.md");
@@ -453,6 +470,18 @@ describe("tool-agnostic loads", () => {
 		expect(first.content.length).toBe(2);
 		expect(first.content[1]!.text).toContain("Step 1: follow rule number 1 ");
 		expect(first.content[1]!.text).not.toContain("frontmatter");
+		expect(first.content[1]!.text).not.toContain("file line");
+	});
+
+	it("marks a tool-agnostic first load as resident, so globs do not inject it again", async () => {
+		const skill = longSkill("long-guide", 400).replace("---\n\n#", "globs:\n  - '**/*.zorb'\n---\n\n#");
+		const project = await setup({ [SKILL_REL]: skill, "src/a.zorb": "zorb" });
+		const path = join(project.root, SKILL_REL);
+
+		await project.run("exec", { code: "cell" }, { command: `tail -c 3000 ${path}` });
+		const touch = await project.run("read", { path: join(project.root, "src/a.zorb") });
+
+		expect(countOf(touch.text, "Step 1: follow rule number 1 ")).toBe(0);
 	});
 
 	it("completes a first load whose input never names the file", async () => {
