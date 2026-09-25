@@ -101,18 +101,20 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 
 	const tools = { read: createReadTool(root), bash: createBashTool(root) };
 
-	type Call = { id: string; toolName: "read" | "bash"; original: Record<string, unknown>; args: Record<string, unknown>; blocked: boolean };
+	/** Foreign tools (an MCP wrapper, a notebook cell) run `command` through the real bash tool under their own name and input. */
+	type RunOptions = { failWith?: string; command?: string };
+	type Call = { id: string; toolName: string; original: Record<string, unknown>; args: Record<string, unknown>; blocked: boolean; command?: string };
 
 	/** Pi runs every tool_call hook of a batch (sequentially) before any tool executes. */
-	async function prepare(toolName: "read" | "bash", input: Record<string, unknown>): Promise<Call> {
+	async function prepare(toolName: string, input: Record<string, unknown>, command?: string): Promise<Call> {
 		const id = `call-${++nextId}`;
 		const args = { ...input };
 		const decision = (await emit("tool_call", { type: "tool_call", toolName, toolCallId: id, input: args })) as { block?: boolean } | undefined;
-		return { id, toolName, original: input, args, blocked: Boolean(decision?.block) };
+		return { id, toolName, original: input, args, blocked: Boolean(decision?.block), command };
 	}
 
 	/** Execute with the real tool, run the tool_result chain, and return the final model-facing content. */
-	async function finish(call: Call, options: { failWith?: string } = {}): Promise<{ content: Block[]; details: any; isError: boolean }> {
+	async function finish(call: Call, options: RunOptions = {}): Promise<{ content: Block[]; details: any; isError: boolean }> {
 		let content: Block[];
 		let details: any;
 		let isError = false;
@@ -120,7 +122,10 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 			content = [{ type: "text", text: options.failWith ?? "blocked" }];
 			isError = true;
 		} else {
-			const result = await (tools[call.toolName] as any).execute(call.id, call.args);
+			const result =
+				call.toolName === "read" || call.toolName === "bash"
+					? await (tools[call.toolName] as any).execute(call.id, call.args)
+					: await tools.bash.execute(call.id, { command: call.command! });
 			content = result.content;
 			details = result.details;
 		}
@@ -158,8 +163,8 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 	}
 
 	/** One complete single-call turn. */
-	async function run(toolName: "read" | "bash", input: Record<string, unknown>, options: { failWith?: string } = {}) {
-		const call = await prepare(toolName, input);
+	async function run(toolName: string, input: Record<string, unknown>, options: RunOptions = {}) {
+		const call = await prepare(toolName, input, options.command);
 		const result = await finish(call, options);
 		await persist([{ call, ...result }]);
 		return { args: call.args, text: textOf(result.content), content: result.content, details: result.details, isError: result.isError };
@@ -392,7 +397,7 @@ describe("bash loads", () => {
 		expect(read.text).not.toContain(END_MARKER);
 	});
 
-	it("ignores commands whose output is not the skill's opening", async () => {
+	it("ignores output with fewer than three consecutive skill lines", async () => {
 		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
 		const path = join(project.root, SKILL_REL);
 
@@ -412,6 +417,105 @@ describe("bash loads", () => {
 
 		expect(bash.content.length).toBe(1);
 		expect(bash.text).not.toContain(END_MARKER);
+	});
+});
+
+describe("tool-agnostic loads", () => {
+	// pi-codex-conversion's exec_command keeps only the END of long output
+	// (truncateToTail) and prints no notice through the notebook's text(r.output).
+	it("completes a tail-only first load from a notebook-style tool", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const path = join(project.root, SKILL_REL);
+		const code = `const r = await tools.exec_command({cmd: "cat ${path}", max_output_tokens: 750}); text(r.output);`;
+
+		const first = await project.run("exec", { code }, { command: `tail -c 3000 ${path}` });
+
+		expect(first.content.length).toBe(2);
+		expect(first.content[0]!.text).not.toContain("name: long-guide");
+		expect(first.content[1]!.text).toContain("name: long-guide");
+		expect(first.content[1]!.text).toContain("Step 1: follow rule number 1 ");
+		expect(first.content[1]!.text).toContain("<skill_context>");
+	});
+
+	it("completes a first load whose input never names the file", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const dir = join(project.root, ".pi/skills/long-guide");
+
+		const first = await project.run("exec", { code: "print(open(p).read()[:4000])" }, { command: `head -c 4000 ${dir}/SKILL.md` });
+
+		expect(first.content.length).toBe(2);
+		expect(first.content[1]!.text).toContain(END_MARKER);
+	});
+
+	it("completes a first middle window", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+
+		const first = await project.run("bash", { command: `sed -n '201,260p' ${SKILL_REL}` });
+
+		expect(first.content.length).toBe(2);
+		expect(first.content[1]!.text).toContain("Step 1: follow rule number 1 ");
+		expect(first.content[1]!.text).toContain(END_MARKER);
+	});
+
+	it("recognizes line-numbered output, and a complete numbered load needs nothing appended", async () => {
+		const partial = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const numberedHead = await partial.run("bash", { command: `cat -n ${SKILL_REL} | head -n 80` });
+		expect(numberedHead.content.length).toBe(2);
+		expect(numberedHead.content[1]!.text).toContain(END_MARKER);
+
+		const whole = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const numberedAll = await whole.run("bash", { command: `cat -n ${SKILL_REL}` });
+		expect(numberedAll.content.length).toBe(1);
+		expect(countOf(numberedAll.text, END_MARKER)).toBe(1);
+	});
+
+	it("attributes shared boilerplate to the skill actually loaded", async () => {
+		const shared = "## Safety\n\nNever push to main without review.\nAlways run the full test suite first.\nAsk before deleting any branch.\n";
+		const project = await setup({
+			[SKILL_REL]: longSkill("long-guide", 300) + shared,
+			".pi/skills/other-guide/SKILL.md": longSkill("other-guide", 300) + shared,
+		});
+		const otherPath = join(project.root, ".pi/skills/other-guide/SKILL.md");
+
+		const whole = await project.run("bash", { command: `cat ${SKILL_REL}` });
+		const other = await project.run("read", { path: otherPath, offset: 1, limit: 20 });
+
+		expect(whole.content.length).toBe(1);
+		expect(other.args).toEqual({ path: otherPath });
+		expect(other.text).toContain("Step 300: follow rule number 300 of the other-guide");
+	});
+
+	it("names no skill when two skills tie on identical text", async () => {
+		const body = (name: string) => longSkill("twin", 300).replace("name: twin", `name: ${name}`);
+		const project = await setup({ [SKILL_REL]: body("long-guide"), ".pi/skills/other-guide/SKILL.md": body("other-guide") });
+		const otherPath = join(project.root, ".pi/skills/other-guide/SKILL.md");
+
+		const window = await project.run("bash", { command: `sed -n '100,140p' ${SKILL_REL}` });
+		const other = await project.run("read", { path: otherPath, offset: 1, limit: 20 });
+
+		expect(window.content.length).toBe(1);
+		expect(other.args).toEqual({ path: otherPath });
+	});
+
+	it("does not count runs of short structural lines", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) + "---\n```\n}\n" });
+		const path = join(project.root, SKILL_REL);
+
+		await project.run("bash", { command: "printf -- '---\\n```\\n}\\n'" });
+		const read = await project.run("read", { path, offset: 1, limit: 30 });
+
+		expect(read.args).toEqual({ path });
+	});
+
+	it("rebuilds tool-agnostic loads on resume", async () => {
+		const first = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const path = join(first.root, SKILL_REL);
+		await first.run("exec", { code: "cell 1" }, { command: `tail -c 3000 ${path}` });
+
+		const resumed = await setup({}, { sessionManager: first.sessionManager, root: first.root });
+		const again = await resumed.run("exec", { code: "cell 2" }, { command: `tail -c 3000 ${path}` });
+
+		expect(again.content.length).toBe(1);
 	});
 });
 

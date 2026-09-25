@@ -5,11 +5,12 @@ import {
 	contentText,
 	realpathOrResolve,
 	resultConfirmsFullSkillBody,
-	resultConfirmsSkillBody,
 	skillDocument,
 	type SkillCatalog,
 	type SkillRecord,
 } from "./skill-catalog";
+import { insertSkillContext } from "./skill-delivery";
+import { outputLines, skillLoadEvidence } from "./skill-load-evidence";
 
 /**
  * First-load completeness. Models often load a SKILL.md with a line range
@@ -17,7 +18,8 @@ import {
  * the end of the file never enter context. The first load of each SKILL.md in
  * a session therefore delivers the whole file: a `read` loses its line range
  * and its result becomes the complete file, even past pi's 2000-line/50KB cap;
- * a partial shell load gets the complete file appended. Every later load is
+ * any other tool whose output shows part of the file gets the complete file
+ * appended, whatever the tool is called and however it names the file. Every later load is
  * left native, so the agent can page through a skill it is editing.
  *
  * "Session" means the active branch since its latest compaction: compaction
@@ -67,21 +69,48 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 	}
 
 	/**
-	 * The SKILL.md a successful result loaded. Any `read` of the file counts,
-	 * even a ranged one. Other tools count only when their output shows the
-	 * body's opening, so a grep or stat that names the file is not a load.
+	 * The SKILL.md a successful result loaded, and whether the result already
+	 * holds all of it. Any `read` of the file counts, even a ranged one. Any
+	 * other tool counts when its output shows a run of consecutive file lines
+	 * (skill-load-evidence.ts), so a grep hit or a stat that names the file is
+	 * not a load. Candidates are the catalog plus a SKILL.md the input names,
+	 * which covers files outside the catalog. The strongest run wins; a tie
+	 * (identical text in two skills) names no skill.
 	 */
-	function loadedSkill(toolName: string, input: Record<string, unknown>, text: string, cwd: string): SkillRecord | undefined {
-		if (toolName === "read") return readTarget(input, cwd);
-		if (toolName === "edit" || toolName === "write") return undefined;
-		for (const value of Object.values(input ?? {})) {
-			if (typeof value !== "string") continue;
-			const skill = catalog.findSkillReferencedByCommand(value, cwd);
-			if (!skill) continue;
-			const body = skillDocument(skill.filePath)?.body;
-			return body && resultConfirmsSkillBody(text, body) ? skill : undefined;
+	function loadedSkill(
+		toolName: string,
+		input: Record<string, unknown>,
+		text: string,
+		cwd: string,
+	): { skill: SkillRecord; complete: boolean } | undefined {
+		if (toolName === "read") {
+			const skill = readTarget(input, cwd);
+			return skill ? { skill, complete: false } : undefined;
 		}
-		return undefined;
+		if (toolName === "edit" || toolName === "write") return undefined;
+
+		const candidates = new Map<string, SkillRecord>();
+		for (const skill of catalog.skills.values()) candidates.set(skill.filePath, skill);
+		for (const value of Object.values(input ?? {})) {
+			const named = typeof value === "string" ? catalog.findSkillReferencedByCommand(value, cwd) : undefined;
+			if (named && !candidates.has(named.filePath)) candidates.set(named.filePath, named);
+		}
+
+		const output = outputLines(text);
+		let best: { skill: SkillRecord; complete: boolean; lines: number } | undefined;
+		let tied = false;
+		for (const skill of candidates.values()) {
+			const doc = skillDocument(skill.filePath);
+			const evidence = doc ? skillLoadEvidence(doc, output) : undefined;
+			if (!doc || !evidence) continue;
+			if (best && evidence.lines === best.lines) tied = true;
+			if (!best || evidence.lines > best.lines) {
+				const complete = evidence.complete || resultConfirmsFullSkillBody(text, doc.body);
+				best = { skill, complete, lines: evidence.lines };
+				tied = false;
+			}
+		}
+		return best && !tied ? { skill: best.skill, complete: best.complete } : undefined;
 	}
 
 	function readRaw(skill: SkillRecord): string | undefined {
@@ -110,8 +139,8 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 					if (block.type === "toolCall") calls.set(block.id, block.arguments);
 				}
 			} else if (message.role === "toolResult" && !message.isError) {
-				const skill = loadedSkill(message.toolName, calls.get(message.toolCallId) ?? {}, contentText(message.content), ctx.cwd);
-				if (skill) loaded.add(keyOf(skill));
+				const load = loadedSkill(message.toolName, calls.get(message.toolCallId) ?? {}, contentText(message.content), ctx.cwd);
+				if (load) loaded.add(keyOf(load.skill));
 			}
 		}
 	}
@@ -147,21 +176,23 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 		}
 
 		const text = contentText(event.content);
-		const skill = loadedSkill(event.toolName, event.input, text, ctx.cwd);
-		if (!skill) return undefined;
+		const load = loadedSkill(event.toolName, event.input, text, ctx.cwd);
+		if (!load) return undefined;
+		const { skill, complete } = load;
 		const key = keyOf(skill);
 		const first = !loaded.has(key);
 		loaded.add(key);
-		if (!first || event.toolName === "read" || !fullFirstSkillReadEnabled()) return undefined;
-		const body = skillDocument(skill.filePath)?.body;
+		if (!first || complete || event.toolName === "read" || !fullFirstSkillReadEnabled()) return undefined;
 		const raw = readRaw(skill);
-		if (!body || raw === undefined || resultConfirmsFullSkillBody(text, body)) return undefined;
+		if (raw === undefined) return undefined;
+		// The block carries its own directory context: a tool whose input never
+		// names the file is invisible to delivery, which would otherwise add it.
 		return {
 			content: [
 				...event.content,
 				{
 					type: "text",
-					text: `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so the complete file follows.]\n\n${raw}`,
+					text: `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so the complete file follows.]\n\n${insertSkillContext(raw, skill, ctx.cwd)}`,
 				},
 			],
 		};
