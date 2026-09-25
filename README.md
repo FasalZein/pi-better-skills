@@ -84,6 +84,23 @@ Pi core keeps skills simple and asks the model to resolve relative paths itself.
 - `PI_SKILL_DIR` and `PI_WORKSPACE`
 - dynamic `SKILL.md` shell placeholders for trusted skills
 
+### Skills load whole the first time
+
+Models often load a `SKILL.md` with a line range, for example `offset=1, limit=200`, and sometimes never read the rest. Rules at the end of the file then never reach the model.
+
+The first time a `SKILL.md` loads in a session, the model gets the whole file:
+
+- A `read` of the file loses its `offset`/`limit`, and its result is the complete file, even past pi's 2000-line/50KB read cap.
+- A shell command such as `head -n 200 SKILL.md` whose output shows the start of the skill body gets the complete file appended as an extra block.
+
+Every later load of the same file keeps pi's normal behavior, so the agent can page through a skill it is editing. Compaction starts a new session for this purpose. Tree navigation and resumed sessions count only loads on the active branch since its latest compaction. A failed or blocked read does not count.
+
+To keep pi's native partial reads:
+
+```bash
+PI_BETTER_SKILLS_PARTIAL_SKILL_READS=1 pi
+```
+
 ## Optional: trim pi's built-in docs prompt (`pi-docs`)
 
 Pi core injects a "Pi documentation" block (~280 tokens) into every system prompt, pointing the model at the installed package's README, `docs/`, and `examples/`. `pi-better-skills` can convert that block into a generated skill so its content loads on demand instead:

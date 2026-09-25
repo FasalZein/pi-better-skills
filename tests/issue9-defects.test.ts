@@ -233,6 +233,9 @@ describe("defect 2: the body-bearing block receives the direct-read context", ()
 		const longBodySkill =
 			"---\nname: override-skill\ndescription: Test override skill for issue 9 regressions\nmodel: zai/glm-5.3\nthinking: low\n---\n\nOverride skill body marker with a body long enough that a partial read can cover its eighty-character confirmation prefix without covering the complete body.";
 		const project = await setupProject({ ".pi/skills/override-skill/SKILL.md": longBodySkill });
+		// A first load is completed by default; the opt-out keeps this read partial.
+		const previousOptOut = process.env.PI_BETTER_SKILLS_PARTIAL_SKILL_READS;
+		process.env.PI_BETTER_SKILLS_PARTIAL_SKILL_READS = "1";
 		try {
 			const skillPath = join(project.root, ".pi/skills/override-skill/SKILL.md");
 			const bodyStart = longBodySkill.indexOf("Override skill body marker");
@@ -248,6 +251,8 @@ describe("defect 2: the body-bearing block receives the direct-read context", ()
 			expect(text.startsWith("<skill_context>")).toBe(true);
 			expect(text).toContain("STATUS: partial read");
 		} finally {
+			if (previousOptOut === undefined) delete process.env.PI_BETTER_SKILLS_PARTIAL_SKILL_READS;
+			else process.env.PI_BETTER_SKILLS_PARTIAL_SKILL_READS = previousOptOut;
 			project.cleanup();
 		}
 	});

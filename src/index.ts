@@ -8,6 +8,7 @@ import { registerPiDocsRequestStrip } from "./pi-docs";
 import { createSkillCatalog, cwdPathExists, skillDocument, substitutePiPathVars } from "./skill-catalog";
 import { createSkillResidency } from "./skill-residency";
 import { createSkillDelivery, insertSkillContext, type DeliveryEvent } from "./skill-delivery";
+import { createSkillFirstRead } from "./skill-first-read";
 import { collectSkillReferences, hasResolvableReference, neutralizeDynamicPlaceholders, type RefDeps } from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
 
@@ -335,6 +336,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	const catalog = createSkillCatalog({ onCatalogChange: () => residency.invalidate() });
 	const residency = createSkillResidency(catalog);
 	const delivery = createSkillDelivery({ catalog, residency, applyOverrides: applySkillOverrides });
+	const firstRead = createSkillFirstRead(catalog);
 	let sessionInitialized = false;
 
 		
@@ -481,6 +483,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		residency.clear();
 		await catalog.bootstrap(ctx.cwd, ctx.isProjectTrusted());
 		residency.reconcile(ctx);
+		firstRead.rebuild(ctx);
 		if (ctx.hasUI) setupSkillAutocomplete(ctx, () => catalog.skillList);
 	});
 
@@ -488,16 +491,20 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		// Rebuild from the active branch: retained recent messages may still contain
 		// a body, while summarized messages no longer do.
 		residency.reconcile(ctx, true);
+		// Compaction starts a new session for first-load completeness.
+		firstRead.rebuild(ctx);
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
 		// Tree navigation can move away from a tool result that supplied a body.
 		residency.reconcile(ctx, true);
+		firstRead.rebuild(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
 		sessionInitialized = false;
 		residency.clear();
+		firstRead.clear();
 	});
 
 
@@ -505,6 +512,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (!sessionInitialized) return;
 		residency.reconcile(ctx);
 		residency.releaseAll();
+		firstRead.settle();
 	});
 
 	// Multi-skill prompts are handled entirely by the extension so both the TUI
@@ -619,6 +627,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 					if (uniqueSkillResource) input.path = uniqueSkillResource;
 				}
 			}
+			firstRead.prepareRead(event, ctx);
 		}
 	});
 
@@ -626,15 +635,18 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (sessionInitialized) residency.reconcile(ctx);
 		if (event.isError) {
 			residency.releaseToolCall(event.toolCallId);
+			firstRead.completeResult(event as unknown as DeliveryEvent, ctx);
 			return;
 		}
 		// v1 explicit ownership: the producing tool owns raw reads and skill loading (see README).
 		const owner = (event as { details?: { piBetterSkills?: { version?: unknown; handling?: unknown } } }).details?.piBetterSkills;
 		if (owner?.version === 1 && owner.handling === "explicit") return;
-		const toolEvent = event as unknown as DeliveryEvent;
+		// A first SKILL.md load becomes complete before delivery decorates it.
+		const completed = firstRead.completeResult(event as unknown as DeliveryEvent, ctx);
+		const toolEvent = { ...event, content: completed ?? event.content } as unknown as DeliveryEvent;
 		const plan = delivery.buildDeliveryPlan(toolEvent, ctx);
-		if (!plan) return undefined;
-		return delivery.applyDeliveryPlan(toolEvent, plan, ctx);
+		const delivered = plan ? await delivery.applyDeliveryPlan(toolEvent, plan, ctx) : undefined;
+		return delivered ?? (completed ? { content: completed } : undefined);
 	});
 
 	// Restore original model/thinking when the agent finishes processing a user request.
@@ -644,6 +656,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.on("agent_end", async (_event, ctx) => {
 		if (sessionInitialized) residency.reconcile(ctx);
 		residency.releaseAll();
+		firstRead.settle();
 		await restoreOriginalState(ctx);
 	});
 }
