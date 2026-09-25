@@ -421,20 +421,38 @@ describe("bash loads", () => {
 });
 
 describe("tool-agnostic loads", () => {
-	// pi-codex-conversion's exec_command keeps only the END of long output
-	// (truncateToTail) and prints no notice through the notebook's text(r.output).
-	it("completes a tail-only first load from a notebook-style tool", async () => {
+	// A code-mode tool can cut long output from the front and print no notice.
+	it("completes a tail-only first load from a code-mode tool with the body only", async () => {
 		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
 		const path = join(project.root, SKILL_REL);
-		const code = `const r = await tools.exec_command({cmd: "cat ${path}", max_output_tokens: 750}); text(r.output);`;
+		const code = `const r = await tools.run({cmd: "cat ${path}", budget: 750}); print(r.output);`;
 
 		const first = await project.run("exec", { code }, { command: `tail -c 3000 ${path}` });
 
 		expect(first.content.length).toBe(2);
-		expect(first.content[0]!.text).not.toContain("name: long-guide");
-		expect(first.content[1]!.text).toContain("name: long-guide");
+		const added = first.content[1]!.text!;
+		expect(first.content[0]!.text).not.toContain("# long-guide");
+		expect(added).toContain("# long-guide");
+		expect(added).toContain("Step 1: follow rule number 1 ");
+		expect(added).toContain(END_MARKER);
+		// Body only: the frontmatter is named in the note, not repeated.
+		expect(added).not.toContain("name: long-guide");
+		expect(added).not.toContain("description:");
+		expect(added).toContain("frontmatter (4 lines) is omitted");
+		expect(countOf(added, "<skill_context>")).toBe(1);
+		expect(added.indexOf("<skill_context>")).toBeLessThan(added.indexOf("# long-guide"));
+	});
+
+	it("omits the frontmatter note for a SKILL.md without frontmatter", async () => {
+		const plain = longSkill("plain", 400).replace(/^---[\s\S]*?---\n/, "");
+		const project = await setup({ "notes/plain/SKILL.md": plain });
+		const path = join(project.root, "notes/plain/SKILL.md");
+
+		const first = await project.run("bash", { command: `tail -n 40 ${path}` });
+
+		expect(first.content.length).toBe(2);
 		expect(first.content[1]!.text).toContain("Step 1: follow rule number 1 ");
-		expect(first.content[1]!.text).toContain("<skill_context>");
+		expect(first.content[1]!.text).not.toContain("frontmatter");
 	});
 
 	it("completes a first load whose input never names the file", async () => {
@@ -495,6 +513,58 @@ describe("tool-agnostic loads", () => {
 
 		expect(window.content.length).toBe(1);
 		expect(other.args).toEqual({ path: otherPath });
+	});
+
+	it("recognizes a tail kept inside a JSON string", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const tail = readFileSync(join(project.root, SKILL_REL), "utf-8").slice(-3000);
+		writeFileSync(join(project.root, "out.json"), JSON.stringify({ output: tail, exit_code: 0 }));
+
+		const first = await project.run("exec", { code: "print(JSON.stringify(r))" }, { command: "cat out.json" });
+
+		expect(first.content.length).toBe(2);
+		expect(first.content[1]!.text).toContain("Step 1: follow rule number 1 ");
+	});
+
+	it("recognizes indented, double-encoded, and single-quoted escaped strings", async () => {
+		const tail = longSkill("long-guide", 400).slice(-3000);
+		const forms = {
+			"pretty.json": JSON.stringify({ result: { output: tail } }, null, 2),
+			"double.json": JSON.stringify({ body: JSON.stringify({ output: tail }) }),
+			"repr.txt": `{'output': '${tail.replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\n/g, "\\n")}'}`,
+		};
+		for (const [file, text] of Object.entries(forms)) {
+			const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400), [file]: text });
+			const first = await project.run("exec", { code: "cell" }, { command: `cat ${file}` });
+			expect({ file, blocks: first.content.length }).toEqual({ file, blocks: 2 });
+		}
+	});
+
+	it("appends nothing when a JSON string already holds the whole file", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const whole = readFileSync(join(project.root, SKILL_REL), "utf-8");
+		writeFileSync(join(project.root, "out.json"), JSON.stringify({ output: whole }, null, 2));
+		const path = join(project.root, SKILL_REL);
+
+		const first = await project.run("exec", { code: "cell" }, { command: "cat out.json" });
+		const read = await project.run("read", { path, offset: 1, limit: 30 });
+
+		expect(first.content.length).toBe(1);
+		expect(read.args).toEqual({ path, offset: 1, limit: 30 });
+	});
+
+	it("does not count unrelated escaped JSON", async () => {
+		const project = await setup({
+			[SKILL_REL]: longSkill("long-guide", 400),
+			"out.json": JSON.stringify({ output: "line one\nline two\nStep 7: follow rule number 7 of the long-guide guide.\nother" }),
+		});
+		const path = join(project.root, SKILL_REL);
+
+		const first = await project.run("exec", { code: "cell" }, { command: "cat out.json" });
+		const read = await project.run("read", { path, offset: 1, limit: 30 });
+
+		expect(first.content.length).toBe(1);
+		expect(read.args).toEqual({ path });
 	});
 
 	it("does not count runs of short structural lines", async () => {

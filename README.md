@@ -91,7 +91,8 @@ Models often load a `SKILL.md` with a line range, for example `offset=1, limit=2
 The first time a `SKILL.md` loads in a session, the model gets the whole file:
 
 - A `read` of the file loses its `offset`/`limit`, and its result is the complete file, even past pi's 2000-line/50KB read cap.
-- Any other tool whose output shows part of the file gets the complete file appended as an extra block. This works whatever the tool is called and however it names the file: `head` or `sed` in bash, a notebook or code-mode cell, an MCP wrapper, or a tool that keeps only the end of long output. "Part of the file" means at least three consecutive non-blank lines of it (at least 40 characters), in any position; line-number prefixes such as `cat -n` output are recognized. A single `grep` hit is not a load.
+- Any other tool whose output shows part of the file gets the skill's complete body appended as an extra block. This works whatever the tool is called and however it names the file: `head` or `sed` in bash, a notebook or code-mode cell, an MCP wrapper, or a tool that keeps only the end of long output. "Part of the file" means at least three consecutive non-blank lines of it (at least 40 characters), in any position. Line-number prefixes (`cat -n`) and text inside escaped strings (JSON, nested JSON, single-quoted) are recognized. A single `grep` hit is not a load.
+- The appended block holds the body, not the frontmatter, like the skill tools of other agents. A note says how many frontmatter lines were left out. An agent that edits the skill reads the file again; that read is a later load, so it returns the exact lines.
 
 Every later load of the same file keeps pi's normal behavior, so the agent can page through a skill it is editing. Compaction starts a new session for this purpose. Tree navigation and resumed sessions count only loads on the active branch since its latest compaction. A failed or blocked read does not count.
 

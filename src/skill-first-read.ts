@@ -7,10 +7,11 @@ import {
 	resultConfirmsFullSkillBody,
 	skillDocument,
 	type SkillCatalog,
+	type SkillDocument,
 	type SkillRecord,
 } from "./skill-catalog";
-import { insertSkillContext } from "./skill-delivery";
-import { outputLines, skillLoadEvidence } from "./skill-load-evidence";
+import { skillContextBlock } from "./skill-delivery";
+import { outputViews, skillLoadEvidence } from "./skill-load-evidence";
 
 /**
  * First-load completeness. Models often load a SKILL.md with a line range
@@ -18,7 +19,7 @@ import { outputLines, skillLoadEvidence } from "./skill-load-evidence";
  * the end of the file never enter context. The first load of each SKILL.md in
  * a session therefore delivers the whole file: a `read` loses its line range
  * and its result becomes the complete file, even past pi's 2000-line/50KB cap;
- * any other tool whose output shows part of the file gets the complete file
+ * any other tool whose output shows part of the file gets the complete body
  * appended, whatever the tool is called and however it names the file. Every later load is
  * left native, so the agent can page through a skill it is editing.
  *
@@ -28,6 +29,8 @@ import { outputLines, skillLoadEvidence } from "./skill-load-evidence";
 
 export const PARTIAL_SKILL_READS_ENV = "PI_BETTER_SKILLS_PARTIAL_SKILL_READS";
 const OPT_OUT_OFF_VALUES = new Set(["", "0", "false", "no", "off"]);
+/** Same shape insertSkillContext recognizes. */
+const FRONTMATTER = /^---\r?\n[\s\S]*?\r?\n---\r?\n?/;
 
 /** Default-on; PI_BETTER_SKILLS_PARTIAL_SKILL_READS=1 restores pi's native partial reads. */
 export function fullFirstSkillReadEnabled(env: Record<string, string | undefined> = process.env): boolean {
@@ -96,12 +99,12 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 			if (named && !candidates.has(named.filePath)) candidates.set(named.filePath, named);
 		}
 
-		const output = outputLines(text);
+		const views = outputViews(text);
 		let best: { skill: SkillRecord; complete: boolean; lines: number } | undefined;
 		let tied = false;
 		for (const skill of candidates.values()) {
 			const doc = skillDocument(skill.filePath);
-			const evidence = doc ? skillLoadEvidence(doc, output) : undefined;
+			const evidence = doc ? skillLoadEvidence(doc, views) : undefined;
 			if (!doc || !evidence) continue;
 			if (best && evidence.lines === best.lines) tied = true;
 			if (!best || evidence.lines > best.lines) {
@@ -111,6 +114,22 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 			}
 		}
 		return best && !tied ? { skill: best.skill, complete: best.complete } : undefined;
+	}
+
+	/**
+	 * The body, not the file: loading a skill to use it needs the
+	 * instructions, as skill injectors deliver them. The note names the
+	 * omitted frontmatter so an agent editing the skill knows to read the file
+	 * (a later read is native). The block carries its own directory context:
+	 * a tool whose input never names the file is invisible to delivery.
+	 */
+	function completeBodyBlock(skill: SkillRecord, doc: SkillDocument, cwd: string): string {
+		const frontmatter = doc.raw.match(FRONTMATTER);
+		const omitted = frontmatter
+			? ` Its frontmatter (${frontmatter[0].trimEnd().split("\n").length} lines) is omitted; read the file to see it.`
+			: "";
+		const note = `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so its complete body follows.${omitted}]`;
+		return `${note}\n\n${skillContextBlock(skill, cwd)}\n\n${doc.body}`;
 	}
 
 	function readRaw(skill: SkillRecord): string | undefined {
@@ -183,19 +202,9 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 		const first = !loaded.has(key);
 		loaded.add(key);
 		if (!first || complete || event.toolName === "read" || !fullFirstSkillReadEnabled()) return undefined;
-		const raw = readRaw(skill);
-		if (raw === undefined) return undefined;
-		// The block carries its own directory context: a tool whose input never
-		// names the file is invisible to delivery, which would otherwise add it.
-		return {
-			content: [
-				...event.content,
-				{
-					type: "text",
-					text: `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so the complete file follows.]\n\n${insertSkillContext(raw, skill, ctx.cwd)}`,
-				},
-			],
-		};
+		const doc = skillDocument(skill.filePath);
+		if (!doc) return undefined;
+		return { content: [...event.content, { type: "text", text: completeBodyBlock(skill, doc, ctx.cwd) }] };
 	}
 
 	/** Calls that were blocked before running never produce a result; drop them at turn end. */
