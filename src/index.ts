@@ -643,10 +643,11 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (owner?.version === 1 && owner.handling === "explicit") return;
 		// A first SKILL.md load becomes complete before delivery decorates it.
 		const completed = firstRead.completeResult(event as unknown as DeliveryEvent, ctx);
-		const toolEvent = { ...event, content: completed ?? event.content } as unknown as DeliveryEvent;
+		const toolEvent = { ...event, content: completed?.content ?? event.content } as unknown as DeliveryEvent;
 		const plan = delivery.buildDeliveryPlan(toolEvent, ctx);
 		const delivered = plan ? await delivery.applyDeliveryPlan(toolEvent, plan, ctx) : undefined;
-		return delivered ?? (completed ? { content: completed } : undefined);
+		if (!completed) return delivered;
+		return { content: delivered?.content ?? completed.content, details: completed.details };
 	});
 
 	// Restore original model/thinking when the agent finishes processing a user request.

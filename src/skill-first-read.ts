@@ -34,8 +34,22 @@ export function fullFirstSkillReadEnabled(env: Record<string, string | undefined
 }
 
 type ToolCallEvent = { toolName: string; toolCallId: string; input: Record<string, unknown> };
-type ToolResultEvent = ToolCallEvent & { content: Array<{ type: string; text?: string }>; isError: boolean };
+type ToolResultEvent = ToolCallEvent & { content: Array<{ type: string; text?: string }>; details?: unknown; isError: boolean };
 type Block = ToolResultEvent["content"][number];
+/** Replacement content, plus replacement details when the old ones would misdescribe it. */
+type Completion = { content: Block[]; details?: Record<string, unknown> };
+
+/**
+ * pi's read renderer warns "Truncated: showing N of M lines" from
+ * `details.truncation`. The completed result is the whole file, so the record
+ * is dropped; other details stay. Pi applies any replacement details that
+ * are not undefined, so an empty object clears the record too.
+ */
+function detailsWithoutTruncation(details: unknown): Record<string, unknown> | undefined {
+	if (!details || typeof details !== "object" || !("truncation" in details)) return undefined;
+	const { truncation: _dropped, ...rest } = details as Record<string, unknown>;
+	return rest;
+}
 
 export type SkillFirstRead = ReturnType<typeof createSkillFirstRead>;
 
@@ -113,10 +127,10 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 	}
 
 	/**
-	 * Record the load and return replacement content when this result is a
-	 * first load that is not complete yet. Failed results never count.
+	 * Record the load and return a completion when this result is a first
+	 * load that is not complete yet. Failed results never count.
 	 */
-	function completeResult(event: ToolResultEvent, ctx: ExtensionContext): Block[] | undefined {
+	function completeResult(event: ToolResultEvent, ctx: ExtensionContext): Completion | undefined {
 		const firstRead = inFlight.get(event.toolCallId);
 		inFlight.delete(event.toolCallId);
 		if (event.isError) return undefined;
@@ -126,7 +140,10 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 			const raw = readRaw(firstRead);
 			if (raw === undefined || contentText(event.content) === raw) return undefined;
 			// Keep non-text blocks; the whole file replaces pi's (possibly capped) text.
-			return [{ type: "text", text: raw }, ...event.content.filter((block) => block.type !== "text")];
+			return {
+				content: [{ type: "text", text: raw }, ...event.content.filter((block) => block.type !== "text")],
+				details: detailsWithoutTruncation(event.details),
+			};
 		}
 
 		const text = contentText(event.content);
@@ -139,13 +156,15 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 		const body = skillDocument(skill.filePath)?.body;
 		const raw = readRaw(skill);
 		if (!body || raw === undefined || resultConfirmsFullSkillBody(text, body)) return undefined;
-		return [
-			...event.content,
-			{
-				type: "text",
-				text: `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so the complete file follows.]\n\n${raw}`,
-			},
-		];
+		return {
+			content: [
+				...event.content,
+				{
+					type: "text",
+					text: `[pi-better-skills: the output above is part of ${skill.filePath}. This is the first load of this skill in the session, so the complete file follows.]\n\n${raw}`,
+				},
+			],
+		};
 	}
 
 	/** Calls that were blocked before running never produce a result; drop them at turn end. */

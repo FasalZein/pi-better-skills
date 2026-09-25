@@ -112,8 +112,9 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 	}
 
 	/** Execute with the real tool, run the tool_result chain, and return the final model-facing content. */
-	async function finish(call: Call, options: { failWith?: string } = {}): Promise<{ content: Block[]; isError: boolean }> {
+	async function finish(call: Call, options: { failWith?: string } = {}): Promise<{ content: Block[]; details: any; isError: boolean }> {
 		let content: Block[];
+		let details: any;
 		let isError = false;
 		if (call.blocked || options.failWith) {
 			content = [{ type: "text", text: options.failWith ?? "blocked" }];
@@ -121,16 +122,19 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 		} else {
 			const result = await (tools[call.toolName] as any).execute(call.id, call.args);
 			content = result.content;
+			details = result.details;
 		}
 		let current = content;
 		for (const handler of handlers.get("tool_result") ?? []) {
 			const replaced = (await handler(
-				{ type: "tool_result", toolName: call.toolName, toolCallId: call.id, input: call.args, content: current, isError },
+				{ type: "tool_result", toolName: call.toolName, toolCallId: call.id, input: call.args, content: current, details, isError },
 				ctx,
-			)) as { content?: Block[] } | undefined;
+			)) as { content?: Block[]; details?: unknown } | undefined;
 			if (replaced?.content) current = replaced.content;
+			// Pi applies any replacement details that are not undefined.
+			if (replaced?.details !== undefined) details = replaced.details;
 		}
-		return { content: current, isError };
+		return { content: current, details, isError };
 	}
 
 	/** Persist one assistant message with the batch's calls, then each result, then end the turn. */
@@ -158,7 +162,7 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 		const call = await prepare(toolName, input);
 		const result = await finish(call, options);
 		await persist([{ call, ...result }]);
-		return { args: call.args, text: textOf(result.content), content: result.content, isError: result.isError };
+		return { args: call.args, text: textOf(result.content), content: result.content, details: result.details, isError: result.isError };
 	}
 
 	await emit("session_start", {});
@@ -191,6 +195,19 @@ describe("first SKILL.md read in a session", () => {
 		expect(first.text).toContain("Step 2500: follow rule number 2500");
 		expect(first.text).toContain(END_MARKER);
 		expect(first.text).not.toContain("Use offset=");
+		// pi's read renderer warns from details.truncation; the result is no longer truncated.
+		expect(first.details?.truncation?.truncated).toBeFalsy();
+	});
+
+	it("keeps pi's truncation record on a later capped read", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 2500) });
+		const path = join(project.root, SKILL_REL);
+		await project.run("read", { path });
+
+		const later = await project.run("read", { path });
+
+		expect(later.text).toContain("Use offset=");
+		expect(later.details?.truncation?.truncated).toBe(true);
 	});
 
 	it("also completes a first read given as a workspace-relative path", async () => {
