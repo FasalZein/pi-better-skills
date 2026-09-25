@@ -43,6 +43,11 @@ type ToolResultEvent = ToolCallEvent & { content: Array<{ type: string; text?: s
 type Block = ToolResultEvent["content"][number];
 /** Replacement content, plus replacement details when the old ones would misdescribe it. */
 type Completion = { content: Block[]; details?: Record<string, unknown> };
+/**
+ * A first load may need completing; a later load names its skill so delivery
+ * leaves the result exactly as the tool returned it.
+ */
+export type LoadOutcome = { completion?: Completion; laterLoad?: SkillRecord };
 
 /**
  * pi's read renderer warns "Truncated: showing N of M lines" from
@@ -192,36 +197,41 @@ export function createSkillFirstRead(catalog: SkillCatalog) {
 	}
 
 	/**
-	 * Record the load and return a completion when this result is a first
-	 * load that is not complete yet. Failed results never count.
+	 * Record the load. A first load that is not complete yet gets a
+	 * completion; a later load is reported so it stays native. Failed results
+	 * never count.
 	 */
-	function completeResult(event: ToolResultEvent, ctx: ExtensionContext): Completion | undefined {
+	function completeResult(event: ToolResultEvent, ctx: ExtensionContext): LoadOutcome {
 		const firstRead = inFlight.get(event.toolCallId);
 		inFlight.delete(event.toolCallId);
-		if (event.isError) return undefined;
+		if (event.isError) return {};
 
 		if (firstRead) {
 			loaded.add(keyOf(firstRead));
 			const raw = readRaw(firstRead);
-			if (raw === undefined || contentText(event.content) === raw) return undefined;
+			if (raw === undefined || contentText(event.content) === raw) return {};
 			// Keep non-text blocks; the whole file replaces pi's (possibly capped) text.
 			return {
-				content: [{ type: "text", text: raw }, ...event.content.filter((block) => block.type !== "text")],
-				details: detailsWithoutTruncation(event.details),
+				completion: {
+					content: [{ type: "text", text: raw }, ...event.content.filter((block) => block.type !== "text")],
+					details: detailsWithoutTruncation(event.details),
+				},
 			};
 		}
 
 		const text = contentText(event.content);
 		const load = loadedSkill(event.toolName, event.input, text, ctx.cwd);
-		if (!load) return undefined;
+		if (!load) return {};
 		const { skill, complete } = load;
 		const key = keyOf(skill);
-		const first = !loaded.has(key);
+		// A parallel first read still in flight makes this one a later load.
+		const first = !seen(key);
 		loaded.add(key);
-		if (!first || complete || event.toolName === "read" || !fullFirstSkillReadEnabled()) return undefined;
+		if (!first) return { laterLoad: skill };
+		if (complete || event.toolName === "read" || !fullFirstSkillReadEnabled()) return {};
 		const doc = skillDocument(skill.filePath);
-		if (!doc) return undefined;
-		return { content: [...event.content, { type: "text", text: completeBodyBlock(skill, doc, ctx.cwd) }] };
+		if (!doc) return {};
+		return { completion: { content: [...event.content, { type: "text", text: completeBodyBlock(skill, doc, ctx.cwd) }] } };
 	}
 
 	/** Calls that were blocked before running never produce a result; drop them at turn end. */

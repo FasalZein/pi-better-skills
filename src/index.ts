@@ -642,9 +642,11 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		const owner = (event as { details?: { piBetterSkills?: { version?: unknown; handling?: unknown } } }).details?.piBetterSkills;
 		if (owner?.version === 1 && owner.handling === "explicit") return;
 		// A first SKILL.md load becomes complete before delivery decorates it.
-		const completed = firstRead.completeResult(event as unknown as DeliveryEvent, ctx);
+		const { completion: completed, laterLoad } = firstRead.completeResult(event as unknown as DeliveryEvent, ctx);
+		// A later load stays native, but it still names the skill in use.
+		if (laterLoad) residency.activeSkill = laterLoad;
 		const toolEvent = { ...event, content: completed?.content ?? event.content } as unknown as DeliveryEvent;
-		const plan = delivery.buildDeliveryPlan(toolEvent, ctx);
+		const plan = delivery.buildDeliveryPlan(toolEvent, ctx, laterLoad);
 		const delivered = plan ? await delivery.applyDeliveryPlan(toolEvent, plan, ctx) : undefined;
 		if (!completed) return delivered;
 		return { content: delivered?.content ?? completed.content, details: completed.details };

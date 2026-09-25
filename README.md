@@ -94,7 +94,7 @@ The first time a `SKILL.md` loads in a session, the model gets the whole file:
 - Any other tool whose output shows part of the file gets the skill's complete body appended as an extra block. This works whatever the tool is called and however it names the file: `head` or `sed` in bash, a notebook or code-mode cell, an MCP wrapper, or a tool that keeps only the end of long output. "Part of the file" means at least three consecutive non-blank lines of it (at least 40 characters), in any position. Line-number prefixes (`cat -n`) and text inside escaped strings (JSON, nested JSON, single-quoted) are recognized. A single `grep` hit is not a load.
 - The appended block holds the body, not the frontmatter, like the skill tools of other agents. It uses the same `<skill name="…" location="…">` tag as pi's own skill blocks, so the file is named even when the tool call did not name it. A one-line note says the frontmatter is omitted, gives the file line where the body starts, and says to read the file only for its exact contents, for example to edit the skill. That read is a later load, so it returns the exact lines.
 
-Every later load of the same file keeps pi's normal behavior, so the agent can page through a skill it is editing. Compaction starts a new session for this purpose. Tree navigation and resumed sessions count only loads on the active branch since its latest compaction. A failed or blocked read does not count.
+Every later load of the same file comes back exactly as the tool returned it: no `<skill_context>`, no dynamic shell output, no model or thinking switch, and no referenced skills. The agent sees the file's real lines, so it can page through or edit a skill safely. The one exception is the active skill used for resolving relative paths, which a later load still updates. Compaction starts a new session for this purpose. Tree navigation and resumed sessions count only loads on the active branch since its latest compaction. A failed or blocked read does not count.
 
 To keep pi's native partial reads:
 
@@ -389,7 +389,7 @@ Project trust still applies. The extension does not discover skills from a proje
 
 ## Trust and safety
 
-Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is read.
+Skills can instruct the model to run commands, and dynamic skill placeholders can run shell commands when a skill is first read in a session.
 
 Project-scoped skills (`.pi/skills`, project `.agents/skills`, skill entries in project `.pi/settings.json`) are discovered only after you trust the project. This matches the boundary of pi itself. Global skills, packages, entries in `~/.pi/agent/settings.json`, and explicit CLI `--skill` paths are always discoverable.
 

@@ -81,13 +81,14 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 		getContextUsage: () => ({ tokens: 100 }),
 		getSystemPrompt: () => "",
 	};
+	const thinkingCalls: string[] = [];
 	const pi = {
 		on: (event: string, handler: Handler) => handlers.set(event, [...(handlers.get(event) ?? []), handler]),
 		registerMessageRenderer: () => {},
 		sendMessage: () => {},
 		setModel: async () => true,
 		getThinkingLevel: () => "off",
-		setThinkingLevel: () => {},
+		setThinkingLevel: (level: string) => thinkingCalls.push(level),
 		getCommands: () => [],
 	};
 	const extension = (await import("../src/index")).default;
@@ -171,7 +172,12 @@ async function setup(files: Record<string, string>, options: { sessionManager?: 
 	}
 
 	await emit("session_start", {});
-	return { root, sessionManager, emit, prepare, finish, persist, run };
+	/** What the tool itself returns, with no extension involved. */
+	async function native(toolName: "read" | "bash", input: Record<string, unknown>): Promise<string> {
+		return textOf((await (tools[toolName] as any).execute(`native-${++nextId}`, input)).content);
+	}
+
+	return { root, sessionManager, emit, prepare, finish, persist, run, native, thinkingCalls };
 }
 
 const SKILL_REL = ".pi/skills/long-guide/SKILL.md";
@@ -301,6 +307,97 @@ describe("first SKILL.md read in a session", () => {
 
 		expect(retry.args).toEqual({ path });
 		expect(retry.text).toContain(END_MARKER);
+	});
+});
+
+describe("later loads are exactly native", () => {
+	// Dynamic shell placeholders only run for trusted skill roots.
+	function trustProjectShell() {
+		const previous = process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+		process.env.PI_TRUST_PROJECT_SKILL_SHELL = "1";
+		cleanups.push(() => {
+			if (previous === undefined) delete process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+			else process.env.PI_TRUST_PROJECT_SKILL_SHELL = previous;
+		});
+	}
+	const DYNAMIC_LINE = "Build id: !`echo DYN-$((40+2))`";
+	const withDynamic = (skill: string) => skill.replace("# long-guide", `# long-guide\n\n${DYNAMIC_LINE}`);
+
+	it("decorates and runs the first load, then returns later reads unchanged", async () => {
+		trustProjectShell();
+		const project = await setup({ [SKILL_REL]: withDynamic(longSkill("long-guide", 400)) });
+		const path = join(project.root, SKILL_REL);
+
+		const first = await project.run("read", { path, offset: 1, limit: 50 });
+		expect(first.text).toContain("<skill_context>");
+		expect(first.text).toContain("Build id: DYN-42");
+
+		const later = await project.run("read", { path });
+		expect(later.text).toBe(await project.native("read", { path }));
+		expect(later.text).not.toContain("<skill_context>");
+		expect(later.text).toContain(DYNAMIC_LINE);
+
+		const ranged = await project.run("read", { path, offset: 1, limit: 12 });
+		expect(ranged.text).toBe(await project.native("read", { path, offset: 1, limit: 12 }));
+	});
+
+	it("keeps a parallel second read native even when its result arrives first", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const path = join(project.root, SKILL_REL);
+
+		const first = await project.prepare("read", { path, offset: 1, limit: 100 });
+		const second = await project.prepare("read", { path, offset: 101, limit: 100 });
+		const secondResult = await project.finish(second);
+		const firstResult = await project.finish(first);
+		await project.persist([
+			{ call: first, ...firstResult },
+			{ call: second, ...secondResult },
+		]);
+
+		expect(textOf(firstResult.content)).toContain("<skill_context>");
+		expect(textOf(secondResult.content)).toBe(await project.native("read", { path, offset: 101, limit: 100 }));
+	});
+
+	it("returns a later shell load unchanged", async () => {
+		trustProjectShell();
+		const project = await setup({ [SKILL_REL]: withDynamic(longSkill("long-guide", 400)) });
+		await project.run("bash", { command: `head -n 60 ${SKILL_REL}` });
+
+		for (const command of [`cat ${SKILL_REL}`, `head -n 30 ${SKILL_REL}`]) {
+			const later = await project.run("bash", { command });
+			expect(later.content.length).toBe(1);
+			expect(later.text).toBe(await project.native("bash", { command }));
+		}
+	});
+
+	it("applies frontmatter overrides only on the first load", async () => {
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 40).replace("---\n\n#", "thinking: low\n---\n\n#") });
+		const path = join(project.root, SKILL_REL);
+
+		await project.run("read", { path });
+		await project.emit("agent_end", {});
+		expect(project.thinkingCalls).toEqual(["low", "off"]);
+
+		await project.run("read", { path });
+		await project.run("bash", { command: `cat ${SKILL_REL}` });
+		expect(project.thinkingCalls).toEqual(["low", "off"]);
+	});
+
+	it("keeps later loads unchanged when partial reads are opted out", async () => {
+		const previous = process.env[OPT_OUT_ENV];
+		process.env[OPT_OUT_ENV] = "1";
+		cleanups.push(() => {
+			if (previous === undefined) delete process.env[OPT_OUT_ENV];
+			else process.env[OPT_OUT_ENV] = previous;
+		});
+		const project = await setup({ [SKILL_REL]: longSkill("long-guide", 400) });
+		const path = join(project.root, SKILL_REL);
+
+		const first = await project.run("read", { path, offset: 1, limit: 30 });
+		const later = await project.run("read", { path, offset: 1, limit: 30 });
+
+		expect(first.text).toContain("<skill_context>");
+		expect(later.text).toBe(await project.native("read", { path, offset: 1, limit: 30 }));
 	});
 });
 

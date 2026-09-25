@@ -190,7 +190,13 @@ export function createSkillDelivery(deps: {
 	}
 
 	/** Detection and resolution only: no claims, no mutations, no shell runs. */
-	function buildDeliveryPlan(event: DeliveryEvent, ctx: ExtensionContext): SkillDeliveryPlan | undefined {
+	/**
+	 * `laterLoad` names a skill the session already loaded: its result stays
+	 * exactly as the tool returned it (no context block, no dynamic shell, no
+	 * overrides, no reference appends), so an agent reading the skill again,
+	 * for example to edit it, sees the file's real lines.
+	 */
+	function buildDeliveryPlan(event: DeliveryEvent, ctx: ExtensionContext, laterLoad?: SkillRecord): SkillDeliveryPlan | undefined {
 		// Phase 1: identify the directly targeted skill (SKILL.md read / command
 		// referencing SKILL.md).
 		let skill: SkillRecord | undefined;
@@ -223,6 +229,10 @@ export function createSkillDelivery(deps: {
 			}
 			if (skill && !confirmedSkillRead(event, skill)) return undefined;
 			if (skill) skillBodyComplete = confirmedCompleteSkillRead(event, skill);
+		}
+		if (skill && laterLoad && realpathOrResolve(skill.filePath) === realpathOrResolve(laterLoad.filePath)) {
+			skill = undefined;
+			skillBodyComplete = false;
 		}
 
 		// Phase 2: find skills whose globs match a path named by arbitrary tool
