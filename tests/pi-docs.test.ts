@@ -2,7 +2,8 @@ import { describe, it, expect } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { piDocsSkillFilePath, registerPiDocsRequestStrip, stripPiDocsBlock } from "../src/pi-docs";
+import { applyPiDocsPayloadStrip, piDocsSkillFilePath, registerPiDocsRequestStrip, stripPiDocsBlock } from "../src/pi-docs";
+import { payloadSystemSlots } from "../src/payload-system-slots";
 
 /** Mirrors pi core's built-in block (dist/core/system-prompt.js) — independent source of truth. */
 const REAL_BLOCK = `Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
@@ -216,11 +217,13 @@ type FakeCommand = { name: string; source: string; sourceInfo?: { path: string }
  */
 function registeredStripFixture(agentDir: string) {
 	const contextHandlers: Array<(...args: unknown[]) => unknown> = [];
+	const payloadHandlers: Array<(...args: unknown[]) => unknown> = [];
 	let loaded: FakeCommand[] = [];
 	const discover = registerPiDocsRequestStrip(
 		{
 			on(event: string, handler: (...args: unknown[]) => unknown) {
 				if (event === "context_with_system") contextHandlers.push(handler);
+				if (event === "before_provider_request") payloadHandlers.push(handler);
 				return () => {};
 			},
 			getCommands: () => loaded,
@@ -234,6 +237,9 @@ function registeredStripFixture(agentDir: string) {
 			(await contextHandlers[0]?.({ type: "context_with_system", messages }, {})) as
 				| { messages: unknown[] }
 				| undefined,
+		/** Fire the before_provider_request handler the registration installed. */
+		strippedPayload: async (payload: unknown) =>
+			(await payloadHandlers[0]?.({ type: "before_provider_request", payload }, {})) as unknown,
 		load: () => {
 			loaded = [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: piDocsSkillFilePath(agentDir) } }];
 		},
@@ -648,6 +654,189 @@ describe("pi-docs extension wiring (src/index.ts)", () => {
 			else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 			rmSync(agentDir, { recursive: true, force: true });
 			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Payload stage (before_provider_request): enforcement after forced prompts.
+// Pi applies a before_agent_start-returned systemPrompt AFTER the
+// context_with_system chain, so a forced head built from the base prompt
+// resurrects the captured block; the payload stage strips it from the final
+// wire payload, idempotently and fail-open.
+// ---------------------------------------------------------------------------
+
+const FORCED_SUFFIX = "\n\n<task_policy_probe>forcing-extension policy suffix</task_policy_probe>";
+
+function loadedPiDocsCommands(agentDir: string): FakeCommand[] {
+	return [{ name: "skill:pi-docs", source: "skill", sourceInfo: { path: piDocsSkillFilePath(agentDir) } }];
+}
+
+describe("payloadSystemSlots (bounded pi-ai carrier map)", () => {
+	it("reads openai-completions/mistral messages[0] with either instruction role", () => {
+		for (const role of ["system", "developer"]) {
+			const payload = { messages: [{ role, content: "A" }] };
+			const slots = payloadSystemSlots(payload);
+			expect(slots).toHaveLength(1);
+			expect(slots[0].read()).toBe("A");
+			slots[0].write("B");
+			expect(payload.messages[0].content).toBe("B");
+		}
+	});
+
+	it("reads openai-responses input[0]", () => {
+		const payload = { input: [{ role: "developer", content: "A" }] };
+		expect(payloadSystemSlots(payload)[0]?.read()).toBe("A");
+	});
+
+	it("reads every anthropic text block and preserves sibling fields", () => {
+		const payload = {
+			system: [
+				{ type: "text", text: "Claude Code identity", cache_control: { type: "ephemeral" } },
+				{ type: "text", text: "the actual prompt" },
+			],
+		};
+		const slots = payloadSystemSlots(payload);
+		expect(slots).toHaveLength(2);
+		expect(slots[0].read()).toBe("Claude Code identity");
+		slots[1].write("rewritten");
+		expect(payload.system[1].text).toBe("rewritten");
+		expect(payload.system[0].cache_control).toEqual({ type: "ephemeral" });
+	});
+
+	it("reads bedrock text blocks and skips cachePoint blocks", () => {
+		const payload = { system: [{ text: "the prompt" }, { cachePoint: { type: "default" } }] };
+		const slots = payloadSystemSlots(payload);
+		expect(slots).toHaveLength(1);
+		expect(slots[0].read()).toBe("the prompt");
+	});
+
+	it("reads codex instructions and google config.systemInstruction", () => {
+		expect(payloadSystemSlots({ instructions: "A" })[0]?.read()).toBe("A");
+		const google = { config: { systemInstruction: "B", temperature: 1 } };
+		expect(payloadSystemSlots(google)[0]?.read()).toBe("B");
+	});
+
+	it("returns no slots for unknown or non-system shapes", () => {
+		expect(payloadSystemSlots({ foo: "bar" })).toEqual([]);
+		expect(payloadSystemSlots({ messages: [{ role: "user", content: "hi" }] })).toEqual([]);
+		expect(payloadSystemSlots({ system: "a plain string pi never sends" })).toEqual([]);
+		expect(payloadSystemSlots(null)).toEqual([]);
+	});
+});
+
+describe("applyPiDocsPayloadStrip (payload stage)", () => {
+	it("strips the captured block from a forced flat head and keeps the forcer suffix", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		try {
+			const forced = `${promptWithDocsSection(REAL_BLOCK)}${FORCED_SUFFIX}`;
+			const payload = { messages: [{ role: "system", content: forced }] };
+			const result = applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir);
+			expect(result).toBe(payload);
+			const content = payload.messages[0].content as string;
+			expect(content).not.toContain("Pi documentation (read only");
+			expect(content).not.toContain("<docs>");
+			expect(content).toContain("<rules>");
+			expect(content).toContain("<task_policy_probe>");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("is a no-op when the block is absent (byte-identical payload)", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		try {
+			const payload = { messages: [{ role: "system", content: promptWithDocsSection("not the block").replace("<docs>\nnot the block\n</docs>\n\n", "") }] };
+			const before = JSON.stringify(payload);
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+			expect(JSON.stringify(payload)).toBe(before);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("fails open on unknown payload shapes", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		try {
+			expect(applyPiDocsPayloadStrip({ foo: "bar" }, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("leaves a present-but-nonexact block untouched (watchdog path)", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		try {
+			// The block text appears with neither the <docs> wrapper nor the
+			// blank-line join, so exact-text removal must refuse to guess.
+			const payload = { messages: [{ role: "system", content: `Preamble:${REAL_BLOCK}` }] };
+			const before = payload.messages[0].content;
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+			expect(payload.messages[0].content).toBe(before);
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("holds the existing gates: opt-out, no capture, skill not loaded", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		const saved = process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
+		try {
+			const payload = { messages: [{ role: "system", content: `${promptWithDocsSection(REAL_BLOCK)}${FORCED_SUFFIX}` }] };
+			process.env.PI_BETTER_SKILLS_NO_PI_DOCS = "1";
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+			delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
+			expect(applyPiDocsPayloadStrip(payload, undefined, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, [], agentDir)).toBeUndefined();
+			expect(payload.messages[0].content).toContain("Pi documentation (read only");
+		} finally {
+			if (saved === undefined) delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
+			else process.env.PI_BETTER_SKILLS_NO_PI_DOCS = saved;
+			cleanup();
+		}
+	});
+
+	it("is idempotent: a second pass over a stripped payload changes nothing", () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-");
+		try {
+			const payload = { messages: [{ role: "system", content: `${promptWithDocsSection(REAL_BLOCK)}${FORCED_SUFFIX}` }] };
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBe(payload);
+			const stripped = JSON.stringify(payload);
+			expect(applyPiDocsPayloadStrip(payload, REAL_BLOCK, loadedPiDocsCommands(agentDir), agentDir)).toBeUndefined();
+			expect(JSON.stringify(payload)).toBe(stripped);
+		} finally {
+			cleanup();
+		}
+	});
+});
+
+describe("registerPiDocsRequestStrip payload registration", () => {
+	it("strips a forced payload through the installed before_provider_request handler", async () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-reg-");
+		try {
+			const fixture = registeredStripFixture(agentDir);
+			await fixture.discover(promptWithDocsSection(REAL_BLOCK));
+			fixture.load();
+			const payload = { messages: [{ role: "system", content: `${promptWithDocsSection(REAL_BLOCK)}${FORCED_SUFFIX}` }] };
+			const result = (await fixture.strippedPayload(payload)) as typeof payload;
+			expect(result).toBe(payload);
+			expect(payload.messages[0].content).not.toContain("Pi documentation (read only");
+			expect(payload.messages[0].content).toContain("<task_policy_probe>");
+		} finally {
+			cleanup();
+		}
+	});
+
+	it("stands down at the payload stage without a discovery capture", async () => {
+		const { agentDir, cleanup } = tempAgentDir("pi-docs-payload-reg-");
+		try {
+			const fixture = registeredStripFixture(agentDir);
+			fixture.load();
+			const payload = { messages: [{ role: "system", content: `${promptWithDocsSection(REAL_BLOCK)}${FORCED_SUFFIX}` }] };
+			expect(await fixture.strippedPayload(payload)).toBeUndefined();
+			expect(payload.messages[0].content).toContain("Pi documentation (read only");
+		} finally {
+			cleanup();
 		}
 	});
 });

@@ -1,4 +1,4 @@
-import { expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -227,7 +227,7 @@ it("composes with the pi-docs request strip at the same seam", async () => {
 	}
 });
 
-it("ships a later forced whole prompt without the block, and still injects on idle turns (known limitation)", async () => {
+it("pi-level head still ships a forced whole prompt verbatim; wire-level re-assertion is wire-tested", async () => {
 	const built = await fixture({ extensionFactories: [registerExtension, forcedPromptExtension] });
 	try {
 		const record = (context: TranscriptContext) => {
@@ -236,8 +236,11 @@ it("ships a later forced whole prompt without the block, and still injects on id
 		};
 		built.faux.setResponses([record, record]);
 		await built.session.prompt("ping");
-		// Normal turn: pi applies the forced prompt AFTER context_with_system,
-		// so it wins byte-exact and the injected section is gone for this run.
+		// Normal turn: pi applies the forced prompt AFTER context_with_system, so
+		// the pi-level head observed here (faux never fires before_provider_request)
+		// is the forced text verbatim, without the injected section. The payload
+		// stage re-asserts the section on the wire for pi-derived forced prompts;
+		// that enforcement is proven in tests/pi-docs-payload-wire.test.ts.
 		expect(built.requests).toHaveLength(1);
 		expect(getCurrentSystemPrompt(built.requests[0].messages)).toBe(FORCED_PROMPT);
 
@@ -259,3 +262,48 @@ function textOf(message: { content: unknown }): string {
 	if (!Array.isArray(message.content)) return "";
 	return message.content.filter(block => block.type === "text").map(block => block.text).join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Payload stage: re-assert the guidance after a forced prompt replaced the
+// request head (before_agent_start return applied after context_with_system).
+// ---------------------------------------------------------------------------
+
+import { AGENT_SKILLS_SECTION, reassertAgentSkillsSection, registerAgentSkillsPayloadReassertion } from "../src/agent-skills-prompt";
+
+describe("reassertAgentSkillsSection (payload stage)", () => {
+	it("appends the section to a pi-derived forced prompt that lost it", () => {
+		const forced = "<rules>\n- Be concise\n</rules>\n\n<skills>\n<available_skills>\n</available_skills>\n</skills>\n\n<task_policy_probe>suffix</task_policy_probe>";
+		expect(reassertAgentSkillsSection(forced)).toBe(`${forced}\n\n${AGENT_SKILLS_SECTION}`);
+	});
+
+	it("changes nothing when the exact section is already present", () => {
+		const text = `<skills>\ncatalog\n</skills>\n\n${AGENT_SKILLS_SECTION}`;
+		expect(reassertAgentSkillsSection(text)).toBeUndefined();
+	});
+
+	it("leaves foreign forced prompts without pi's skills catalog untouched", () => {
+		expect(reassertAgentSkillsSection("Another extension owns this whole prompt.")).toBeUndefined();
+		expect(reassertAgentSkillsSection("<agent_skills>quoted in a context file</agent_skills> but no skills catalog")).toBeUndefined();
+	});
+});
+
+describe("registerAgentSkillsPayloadReassertion", () => {
+	it("rewrites recognized payload slots and returns the payload; foreign prompts pass through", async () => {
+		const handlers: Array<(...args: unknown[]) => unknown> = [];
+		registerAgentSkillsPayloadReassertion({
+			on: (event: string, handler: (...args: unknown[]) => unknown) => {
+				if (event === "before_provider_request") handlers.push(handler);
+				return () => {};
+			},
+		} as never);
+
+		const piDerived = { messages: [{ role: "system", content: "<skills>\ncatalog\n</skills>\n\n<task_policy_probe>suffix</task_policy_probe>" }] };
+		const result = (await handlers[0]?.({ type: "before_provider_request", payload: piDerived }, {})) as typeof piDerived;
+		expect(result).toBe(piDerived);
+		expect(piDerived.messages[0].content).toContain(AGENT_SKILLS_SECTION);
+
+		const foreign = { messages: [{ role: "system", content: "Another extension owns this whole prompt." }] };
+		expect(await handlers[0]?.({ type: "before_provider_request", payload: foreign }, {})).toBeUndefined();
+		expect(foreign.messages[0].content).toBe("Another extension owns this whole prompt.");
+	});
+});

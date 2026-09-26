@@ -474,23 +474,29 @@ export default function (pi) {
 		}
 	});
 
-	it("ships a later full-prompt override verbatim (known limitation)", async () => {
+	it("ships a foreign full-prompt override verbatim at the pi level (payload stage is wire-tested)", async () => {
 		const savedOptOut = process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
 		delete process.env.PI_BETTER_SKILLS_NO_PI_DOCS;
 		const built = await buildSession(REAL_EXTENSION_LOADER, (agentDir) => {
 			// A second extension whose before_agent_start returns a whole system
 			// prompt. pi applies that forced projection AFTER context_with_system,
 			// but only on requests whose turn fires before_agent_start (normal
-			// prompts). The strip must neither fight the override (no private-state
-			// hacks) nor mangle it; on idle turns and continuations, which skip
-			// before_agent_start, the per-request strip still applies.
+			// prompts). This faux-level harness observes the pi-level request head:
+			// the override still replaces it verbatim, and this fixture's docs text
+			// is NOT the captured block, so even the payload stage
+			// (before_provider_request) must leave it byte-exact — the foreign
+			// negative case. Enforcement against the REAL captured block on forced
+			// turns is proven at the wire level in tests/pi-docs-payload-wire.test.ts,
+			// because the faux provider never fires before_provider_request. On idle
+			// turns and continuations, which skip before_agent_start, the per-request
+			// context strip still applies.
 			writeFileSync(join(agentDir, "extensions", "override.ts"), FULL_PROMPT_OVERRIDE_EXTENSION);
 		});
 		try {
 			await driveFourRequests(built);
 
 			expect(built.requests).toHaveLength(4);
-			// Normal prompts: the override wins and ships byte-exact, docs included.
+			// Normal prompts: the override replaces the pi-level head byte-exact.
 			expect(built.requests[0].systemPrompt).toBe(OVERRIDE_SYSTEM_PROMPT);
 			expect(built.requests[3].systemPrompt).toBe(OVERRIDE_SYSTEM_PROMPT);
 			// Idle turn and its tool continuation: no before_agent_start fired, so

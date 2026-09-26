@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { join, resolve } from "node:path";
 import type { ContextWithSystemEvent, ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { payloadSystemSlots } from "./payload-system-slots";
 
 /**
  * pi-docs skill: replaces pi core's built-in "Pi documentation" system-prompt
@@ -318,6 +319,50 @@ export function applyPiDocsRequestStrip(
 }
 
 /**
+ * Second enforcement stage, at before_provider_request. Pi applies a
+ * before_agent_start-returned systemPrompt AFTER the context_with_system
+ * chain (forced-prompt projection in agent-session.js), so a forced head
+ * built from the base prompt resurrects this instance's captured docs block
+ * and the context-stage strip never sees it. This hook runs after that
+ * projection and sees the final provider payload: it removes the exact
+ * captured block from every recognized system-text slot, idempotently,
+ * without re-parsing anything. Unknown payload shapes are left untouched
+ * (fail open); a slot that still carries the block after the exact-text
+ * attempt logs a watchdog line instead of failing silently. Returns the
+ * stripped payload, or undefined when nothing changed (caller ships as-is).
+ */
+export function applyPiDocsPayloadStrip(
+	payload: unknown,
+	capturedBlock: string | undefined,
+	commands: ReadonlyArray<LoadedCommand>,
+	agentDir: string = getAgentDir(),
+): unknown {
+	if (!piDocsFeatureEnabled()) return undefined;
+	if (!capturedBlock) return undefined;
+	if (!hasLoadedPiDocsCommand(commands, agentDir)) {
+		piDocsDebug("skill not loaded at our path, payload stays stock");
+		return undefined;
+	}
+	const slots = payloadSystemSlots(payload);
+	if (slots.length === 0) return undefined;
+	let changed = false;
+	for (const slot of slots) {
+		const text = slot.read();
+		if (text === undefined || !text.includes(capturedBlock)) continue;
+		const stripped = stripCapturedPiDocsBlock(text, capturedBlock);
+		if (stripped === undefined) {
+			// Block text present but neither exact shape matches: never guess.
+			piDocsDebug("docs block present in payload slot but exact shape not found; leaving untouched");
+			continue;
+		}
+		slot.write(stripped);
+		changed = true;
+	}
+	if (changed) piDocsDebug("stripped docs from payload system text after forced-prompt projection");
+	return changed ? payload : undefined;
+}
+
+/**
  * Register the per-request docs strip and get this instance's discovery
  * callback. In the extension factory: `const discoverPiDocsSkill =
  * registerPiDocsRequestStrip(pi)`, then the existing resources_discover handler
@@ -342,6 +387,14 @@ export function registerPiDocsRequestStrip(pi: ExtensionAPI, agentDir: string = 
 	pi.on("context_with_system", async (event) => {
 		const stripped = applyPiDocsRequestStrip(event.messages, capturedBlock, pi.getCommands(), agentDir);
 		return stripped ? { messages: stripped } : undefined;
+	});
+
+	// Forced prompts (any extension's before_agent_start return) replace the
+	// request head after context_with_system; the payload stage above re-enforces
+	// the strip on the final wire payload, whatever else touched the request.
+	pi.on("before_provider_request", async (event) => {
+		const payload = (event as { payload?: unknown }).payload;
+		return applyPiDocsPayloadStrip(payload, capturedBlock, pi.getCommands(), agentDir);
 	});
 
 	return (systemPrompt, argv = process.argv) => {

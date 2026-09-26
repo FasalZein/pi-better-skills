@@ -1,4 +1,5 @@
 import type { ContextWithSystemEvent, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { payloadSystemSlots } from "./payload-system-slots";
 
 /**
  * General skill guidance at system-prompt level, injected on EVERY model
@@ -47,8 +48,10 @@ export type RequestMessages = ContextWithSystemEvent["messages"];
  *   of bypassing them. A foreign `agent_skills` value is overwritten: this
  *   extension owns that name and pi core never creates it.
  * - flat whole-prompt head (plain string content): append with a tag presence
- *   check. A forced whole prompt replaces the head after this hook anyway, so
- *   the append mainly serves flat pi prompts.
+ *   check, serving flat pi prompts. A forced prompt (before_agent_start
+ *   return) replaces the head after this hook; the payload stage in
+ *   registerAgentSkillsPayloadReassertion re-asserts the section on the wire
+ *   for forced prompts built from pi's own prompt.
  *
  * A head with neither sections nor string content is skipped fail-open: no
  * injection is better than a mangled prompt.
@@ -85,5 +88,46 @@ export function registerAgentSkillsPrompt(pi: ExtensionAPI): void {
 	pi.on("context_with_system", async (event) => {
 		const injected = injectAgentSkillsSection(event.messages);
 		return injected ? { messages: injected } : undefined;
+	});
+}
+
+/**
+ * Re-assert the general guidance in flat payload system text when a forced
+ * prompt (a before_agent_start return, applied after context_with_system)
+ * replaced the request head and dropped the injected section. Gated on the
+ * text carrying pi's rendered `<skills>` section, which proves the forced
+ * prompt was built from pi's own prompt (the common forcing shape); foreign
+ * forced prompts that never included pi's skills are left untouched. Known
+ * residual, accepted: a transcript that deliberately removes the
+ * agent_skills section BY NAME while keeping the skills catalog would get
+ * the section back; pi section semantics allow such removal, nothing ships
+ * it today, and this extension owns the agent_skills name.
+ */
+export function reassertAgentSkillsSection(text: string): string | undefined {
+	if (!text.includes("<skills>")) return undefined;
+	if (text.includes(AGENT_SKILLS_SECTION)) return undefined;
+	return `${text}\n\n${AGENT_SKILLS_SECTION}`;
+}
+
+/**
+ * Payload stage for the agent_skills section, twin of the pi-docs payload
+ * strip: runs at before_provider_request, after the forced-prompt
+ * projection, over the same bounded system-text slot table. Appends only;
+ * never edits or removes anything.
+ */
+export function registerAgentSkillsPayloadReassertion(pi: ExtensionAPI): void {
+	pi.on("before_provider_request", async (event) => {
+		const payload = (event as { payload?: unknown }).payload;
+		const slots = payloadSystemSlots(payload);
+		let changed = false;
+		for (const slot of slots) {
+			const text = slot.read();
+			if (text === undefined) continue;
+			const next = reassertAgentSkillsSection(text);
+			if (next === undefined) continue;
+			slot.write(next);
+			changed = true;
+		}
+		return changed ? payload : undefined;
 	});
 }

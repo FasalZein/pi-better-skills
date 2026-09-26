@@ -68,7 +68,7 @@ Without this extension, users and skill authors have to over-explain paths:
 
 The path and command guidance travels in two places:
 
-- **System prompt.** A short `<agent_skills>` section sits in the system prompt of every request. It stays exactly the same for the whole conversation, so nothing appears and disappears between replies. It is added as each request is sent and never written into your session files.
+- **System prompt.** A short `<agent_skills>` section sits in the system prompt of every request. It stays exactly the same for the whole conversation, so nothing appears and disappears between replies. It is added as each request is sent and never written into your session files. When another extension forces a whole system prompt for a turn (a `before_agent_start` return, applied after the request transforms), the section is re-asserted on the final payload — but only when the forced text was built from Pi's own prompt (it contains Pi's `<skills>` section); prompts owned entirely by another extension are left untouched.
 - **Skill bodies.** Each delivered skill body carries a small `<skill_context>` block naming the skill's folder and your project folder, so the rules point at the right places.
 
 The extension does not modify the original `SKILL.md` file. If compaction removes the skill text, loading it again restores the directory context too.
@@ -107,6 +107,8 @@ PI_BETTER_SKILLS_PARTIAL_SKILL_READS=1 pi
 Pi core injects a "Pi documentation" block (~280 tokens) into every system prompt, pointing the model at the installed package's README, `docs/`, and `examples/`. `pi-better-skills` can convert that block into a generated skill so its content loads on demand instead:
 
 - The block is removed from every request sent to the model, including replies started by background helpers or by tool results. A `pi-docs` skill is registered whose body is inherited verbatim from the live block, matching the installed Pi's wording and paths.
+- Removal happens in two stages. The request stage (`context_with_system`) trims pi's own head. The payload stage (`before_provider_request`) re-enforces the strip after a forced prompt — another extension's `before_agent_start` return, which Pi applies after the request transforms — rebuilds the head from the base prompt. Exact-text removal in both stages keeps the surviving prompt byte-stable across turns for provider caching, and forced prompts that do not contain Pi's exact block ship byte-exact.
+- The payload stage recognizes the system-text carriers of the pi-ai 0.87.1 API families: openai-completions/Mistral `messages[0]` (role `system` or `developer`), openai-responses/Azure `input[0]`, Anthropic `system[]` text blocks (OAuth identity block included), Bedrock `system[]` text blocks, Codex `instructions`, and Google/Vertex `config.systemInstruction`. Unknown payload shapes are left untouched (fail open), and `PI_BETTER_SKILLS_DEBUG=1` prints a watchdog line when the block survives a recognized slot.
 - The skill file lives at `<agent-dir>/cache/pi-better-skills/pi-docs/SKILL.md`, outside pi's native skill roots, and is rewritten only when pi's block changes.
 - One gate: the strip happens only when the skill actually loaded at that path. If pi's prompt drifts past the structural anchors (header line and first bullet), the session falls back to completely stock behavior — no strip, no skill, nothing broken. Uninstalling the extension removes the feature and the file together.
 - A user's own `pi-docs` skill wins name collisions; the extension stands down.

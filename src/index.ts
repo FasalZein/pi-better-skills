@@ -3,7 +3,7 @@ import { SkillInvocationMessageComponent } from "@earendil-works/pi-coding-agent
 import { Container, Spacer } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { registerAgentSkillsPrompt } from "./agent-skills-prompt";
+import { registerAgentSkillsPayloadReassertion, registerAgentSkillsPrompt } from "./agent-skills-prompt";
 import { registerPiDocsRequestStrip } from "./pi-docs";
 import { createSkillCatalog, cwdPathExists, skillDocument, substitutePiPathVars } from "./skill-catalog";
 import { createSkillResidency } from "./skill-residency";
@@ -565,6 +565,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// General skill guidance rides in the system prompt of every request; the
 	// per-skill blocks stay dirs-only (skill-delivery.ts skillContextBlock).
 	registerAgentSkillsPrompt(pi);
+	// Forced prompts replace the request head after context_with_system; this
+	// re-asserts the guidance on the final payload when the forced text was
+	// built from pi's own prompt (agent-skills-prompt.ts reassertAgentSkillsSection).
+	registerAgentSkillsPayloadReassertion(pi);
 	pi.on("resources_discover", async (_event, ctx) => {
 		await catalog.bootstrap(ctx.cwd, ctx.isProjectTrusted());
 		return discoverPiDocsSkill(ctx.getSystemPrompt());
