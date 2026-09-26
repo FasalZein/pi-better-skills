@@ -18,7 +18,7 @@ import { piDocsSkillFilePath } from "../src/pi-docs";
 // the real Pi pipeline.
 
 const BODY = "# Fixture skill\nRead references/guide.md before responding.";
-const FIRST_PATH_RULE = "Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.";
+const FIRST_PATH_RULE = "Existing relative paths under workspace_dir keep their workspace meaning, even when a skill has the same path.";
 const ABSOLUTE_RULE = "Absolute paths are exact and should not be reinterpreted.";
 const SHELL_RULE = "Do not run dynamic shell placeholders yourself";
 const AGENT_SKILLS_TAG = "<agent_skills>";
@@ -147,7 +147,7 @@ it("delivers general skill guidance in the system prompt of every request across
 		expect(built.requests).toHaveLength(4);
 		const prompts = built.requests.map(request => getCurrentSystemPrompt(request.messages));
 		for (const prompt of prompts) {
-			// Exactly once per request, carrying the historical rules verbatim.
+			// Exactly once per request, carrying the workspace-first path policy.
 			expect(countOccurrences(prompt, AGENT_SKILLS_TAG)).toBe(1);
 			expect(countOccurrences(prompt, "</agent_skills>")).toBe(1);
 			expect(prompt).toContain(FIRST_PATH_RULE);

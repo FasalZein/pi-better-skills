@@ -4,8 +4,8 @@ import { payloadSystemSlots } from "./payload-system-slots";
 /**
  * General skill guidance at system-prompt level, injected on EVERY model
  * request through the public context_with_system hook (the same seam the
- * pi-docs strip uses in pi-docs.ts). The wording is the historical per-skill
- * block's <path_policy> and <dynamic_skill_shell> text, verbatim. Per-skill
+ * pi-docs strip uses in pi-docs.ts). The <path_policy> and
+ * <dynamic_skill_shell> rules are shared across skills. Per-skill
  * <skill_context> blocks keep only <skill_dir>/<workspace_dir>
  * (skill-delivery.ts), so the general rules exist exactly once per request
  * instead of once per delivered body.
@@ -18,7 +18,8 @@ import { payloadSystemSlots } from "./payload-system-slots";
 export const AGENT_SKILLS_SECTION = [
 	"<agent_skills>",
 	"  <path_policy>",
-	"    Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.",
+	"    Existing relative paths under workspace_dir keep their workspace meaning, even when a skill has the same path.",
+	"    When a relative path is absent from workspace_dir, it can resolve from skill_dir if the resource exists there.",
 	"    Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.",
 	"    Use $PI_SKILL_DIR/path for explicit bundled skill files.",
 	"    Use $PI_WORKSPACE/path for explicit workspace/project files.",

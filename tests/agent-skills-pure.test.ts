@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { AGENT_SKILLS_SECTION, injectAgentSkillsSection, type RequestMessages } from "../src/agent-skills-prompt";
 
-// Historical rule lines, pinned verbatim: the system block must keep the exact
-// general wording the per-skill block used before the guidance split.
+// Shared path precedence and dynamic-shell rules, pinned independently of
+// the block's construction so contradictory guidance cannot silently return.
 const PATH_RULES = [
-	"Relative file references in this SKILL.md normally resolve from skill_dir when they exist there.",
+	"Existing relative paths under workspace_dir keep their workspace meaning, even when a skill has the same path.",
+	"When a relative path is absent from workspace_dir, it can resolve from skill_dir if the resource exists there.",
 	"Plain workspace commands like git status and bun test usually run in the workspace unless instructed otherwise.",
 	"Use $PI_SKILL_DIR/path for explicit bundled skill files.",
 	"Use $PI_WORKSPACE/path for explicit workspace/project files.",
@@ -21,7 +22,7 @@ function head(messages: RequestMessages): { sections?: Record<string, string | n
 	return first as unknown as { sections?: Record<string, string | null>; content: unknown };
 }
 
-describe("AGENT_SKILLS_SECTION wording (historical, verbatim)", () => {
+describe("AGENT_SKILLS_SECTION wording", () => {
 	it("wraps the path_policy and dynamic_skill_shell rules in <agent_skills>", () => {
 		expect(AGENT_SKILLS_SECTION.startsWith("<agent_skills>\n")).toBe(true);
 		expect(AGENT_SKILLS_SECTION.endsWith("\n</agent_skills>")).toBe(true);

@@ -53,7 +53,9 @@ or:
 Read reference/troubleshooting.md before continuing.
 ```
 
-and the agent gets pointed at the resource inside the active skill, not a coincidentally named file in the workspace.
+If the relative path does not exist in the workspace, the native `read` and `bash` tools fall back to the skill resource. Existing workspace files and directories take precedence, even when a skill contains the same path. Use `$PI_SKILL_DIR/path` or an absolute skill path to select the bundled resource explicitly.
+
+Path checks use Pi's workspace directory. They do not interpret directory changes inside shell commands. Custom tools keep their own path semantics.
 
 ### Less path babysitting
 

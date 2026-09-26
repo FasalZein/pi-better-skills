@@ -457,14 +457,15 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 			return existsSync(candidate) ? `${prefix}${maybeQuote(candidate, match)}` : match;
 		});
 
-		// Fix relative path tokens against the active skill root when that file
-		// exists inside the skill. Tool cwd stays the workspace, and bare commands
+		// Resolve missing workspace paths against the active skill root.
+		// Existing workspace paths win collisions, and bare commands
 		// like git/bun/rg are untouched because they contain no slash.
 		const relativePathRegex = /(^|[\s\"'(=;|&])((?:\.\/)?[^\s\"'`;|&<>)]*\/[^\s\"'`;|&<>)]*)/g;
 		rewritten = rewritten.replace(relativePathRegex, (match, prefix: string, relPath: string) => {
+			if (cwdPathExists(cwd, relPath)) return match;
 			const absolute = catalog.resolveRelativeResource(relPath, residency.activeSkill);
 			if (absolute) return `${prefix}${maybeQuote(absolute, match)}`;
-			if (residency.activeSkill || cwdPathExists(cwd, relPath)) return match;
+			if (residency.activeSkill) return match;
 			const uniqueSkillResource = catalog.resolveRelativeResource(relPath);
 			return uniqueSkillResource ? `${prefix}${maybeQuote(uniqueSkillResource, match)}` : match;
 		});
@@ -623,10 +624,10 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 					reason: `Blocked unresolved PI path variable. Retry read with the resolved path: ${resolved}`,
 				};
 			}
-			if (!isAbsolute(input.path)) {
+			if (!isAbsolute(input.path) && !cwdPathExists(ctx.cwd, input.path)) {
 				const absolute = catalog.resolveRelativeResource(input.path, residency.activeSkill);
 				if (absolute) input.path = absolute;
-				else if (!residency.activeSkill && !cwdPathExists(ctx.cwd, input.path)) {
+				else if (!residency.activeSkill) {
 					const uniqueSkillResource = catalog.resolveRelativeResource(input.path);
 					if (uniqueSkillResource) input.path = uniqueSkillResource;
 				}
