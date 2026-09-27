@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -43,6 +43,12 @@ test("probe detects absence, lists versions, and ignores unsupported versions re
 	}
 });
 
+test("extension initialization fails when the required event bus is missing", () => {
+	const pi = fakePi(tmpdir());
+	// SAFETY: Deliberately violate the host contract to verify fail-fast initialization.
+	expect(() => extension({ ...pi.api, events: undefined } as never)).toThrow(TypeError);
+});
+
 function fakePi(root: string, events = createEventBus()) {
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => Promise<unknown>>>();
 	const sessionManager = SessionManager.inMemory(root);
@@ -63,9 +69,13 @@ function fakePi(root: string, events = createEventBus()) {
 			if (idle && options === undefined) sessionManager.appendCustomMessageEntry("skill", message.content, true, message.details);
 		},
 	};
-	const emit = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); };
+	const emit = async (name: string, payload: unknown = {}) => {
+		let result: unknown;
+		for (const handler of handlers.get(name) ?? []) result = await handler(payload, ctx);
+		return result;
+	};
 	return {
-		api, events, sent, sessionManager,
+		api, events, sent, sessionManager, emit,
 		setIdle: (value: boolean) => { idle = value; },
 		getProvider: () => providerFactory!({ getSuggestions: async () => null, applyCompletion: () => ({ lines: [], cursorLine: 0, cursorCol: 0 }) }),
 		start: () => emit("session_start"),
@@ -249,16 +259,28 @@ type RealSession = {
 	cleanup: () => void;
 };
 
-async function realSession(hookEvent?: "turn_end" | "agent_end", hookOutcomes: unknown[] = []): Promise<RealSession> {
+async function realSession(hookEvent?: "turn_end" | "agent_end", hookOutcomes: unknown[] = [], dynamicShell?: "trusted" | "untrusted", leadingPlaceholder?: boolean): Promise<RealSession> {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-real-")));
 	const agentDir = join(root, "agent");
 	const cwd = join(root, "workspace");
 	mkdirSync(cwd, { recursive: true });
-	const skillPath = writeSkill(cwd, "api-skill", `---\nname: api-skill\ndescription: API fixture\n---\n\n${MARKER} instructions.\n`);
-	const previous = { HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_BETTER_SKILLS_NO_PI_DOCS: process.env.PI_BETTER_SKILLS_NO_PI_DOCS };
+	const dynamicBody = dynamicShell
+		? leadingPlaceholder
+			? `!\`echo leading-dyn\`\n\n${MARKER} instructions.\n\nBuild id: !\`echo dynamic-output\``
+			: `${MARKER} instructions.\n\nBuild id: !\`echo dynamic-output\``
+		: `${MARKER} instructions.`;
+	const skillPath = writeSkill(cwd, "api-skill", `---\nname: api-skill\ndescription: API fixture\n---\n\n${dynamicBody}\n`);
+	const previous = {
+		HOME: process.env.HOME,
+		PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR,
+		PI_BETTER_SKILLS_NO_PI_DOCS: process.env.PI_BETTER_SKILLS_NO_PI_DOCS,
+		PI_TRUST_PROJECT_SKILL_SHELL: process.env.PI_TRUST_PROJECT_SKILL_SHELL,
+	};
 	process.env.HOME = join(root, "home");
 	process.env.PI_CODING_AGENT_DIR = agentDir;
 	process.env.PI_BETTER_SKILLS_NO_PI_DOCS = "1";
+	// Project skills are untrusted by default; "0" keeps the untrusted variant explicit.
+	if (dynamicShell) process.env.PI_TRUST_PROJECT_SKILL_SHELL = dynamicShell === "trusted" ? "1" : "0";
 	let session: AgentSession | undefined;
 	const cleanup = () => {
 		try {
@@ -340,10 +362,13 @@ test("an API skill requested during an aborted response is delivered exactly onc
 });
 
 test.each([
-	{ label: "alone", siblingRead: false },
-	{ label: "with a parallel sibling read of SKILL.md", siblingRead: true },
-])("a tool-call delivery $label reaches the next response once (real Pi loop)", async ({ siblingRead }) => {
-	const built = await realSession();
+	{ label: "alone", siblingRead: false, dynamicShell: undefined, leadingPlaceholder: false },
+	{ label: "with a parallel sibling read of SKILL.md", siblingRead: true, dynamicShell: undefined, leadingPlaceholder: false },
+	{ label: "with a parallel sibling read of a trusted dynamic SKILL.md", siblingRead: true, dynamicShell: "trusted", leadingPlaceholder: false },
+	{ label: "with a parallel sibling read of an explicitly untrusted dynamic SKILL.md", siblingRead: true, dynamicShell: "untrusted", leadingPlaceholder: false },
+	{ label: "with a parallel sibling read of a trusted dynamic SKILL.md leading with a placeholder", siblingRead: true, dynamicShell: "trusted", leadingPlaceholder: true },
+])("a tool-call delivery $label reaches the next response once (real Pi loop)", async ({ siblingRead, dynamicShell, leadingPlaceholder }) => {
+	const built = await realSession(undefined, [], dynamicShell, leadingPlaceholder);
 	try {
 		built.faux.setResponses([
 			() => fauxAssistantMessage([
@@ -355,6 +380,15 @@ test.each([
 		await built.session.prompt("load the skill");
 		expect(built.requests).toHaveLength(1);
 		expect(bodyCopies(built.requests[0])).toBe(1);
+		// The surviving copy is the sibling read's decorated result, not the queued passive copy.
+		if (dynamicShell) {
+			const requestText = JSON.stringify(built.requests[0]);
+			expect(requestText).toContain("Build id:");
+			expect(requestText).not.toContain("[dynamic shell skipped: passive reference injection]");
+			if (dynamicShell === "trusted") expect(requestText).toContain("Build id: dynamic-output");
+			else expect(requestText).toContain("[dynamic shell skipped: untrusted skill root]");
+			if (leadingPlaceholder) expect(requestText).toContain("leading-dyn");
+		}
 		// The skill stays resident for later requests.
 		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "already-resident" }]);
 	} finally {
@@ -382,5 +416,119 @@ test.each(["turn_end", "agent_end"] as const)("deliver from a later extension's 
 		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "delivered" }]);
 	} finally {
 		built.cleanup();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Transformed-body residency: a decorated read whose dynamic shell placeholders
+// were executed or skipped satisfies the queued API delivery, but only while
+// that transformed result persists on the branch.
+// ---------------------------------------------------------------------------
+
+function textOf(content: Array<{ type: string; text?: string }>): string {
+	return content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text ?? "")
+		.join("\n");
+}
+
+test("a trusted dynamic read satisfies the queued delivery only while its result persists", async () => {
+	const previous = process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+	process.env.PI_TRUST_PROJECT_SKILL_SHELL = "1";
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-dynamic-residency-")));
+	try {
+		const path = writeSkill(root, "child", `---\nname: child\ndescription: child\n---\n\nChild instructions.\n\nBuild id: !\`echo dyn-42\`\n`);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		await pi.start();
+		const before = pi.sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		// Streaming turn: the API delivery queues while a sibling read executes.
+		pi.setIdle(false);
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		const callId = "call-read-1";
+		pi.sessionManager.appendMessage({
+			role: "assistant",
+			content: [{ type: "toolCall", id: callId, name: "read", arguments: { path } }],
+			timestamp: Date.now(),
+		} as never);
+		await pi.emit("tool_call", { type: "tool_call", toolName: "read", toolCallId: callId, input: { path } });
+		const raw = readFileSync(path, "utf-8");
+		const replaced = (await pi.emit("tool_result", {
+			type: "tool_result", toolCallId: callId, toolName: "read", input: { path },
+			content: [{ type: "text", text: raw }], isError: false,
+		})) as { content: Array<{ type: string; text?: string }> } | undefined;
+		const persisted = replaced?.content ?? [{ type: "text", text: raw }];
+		expect(textOf(persisted)).toContain("Build id: dyn-42");
+		// Persist exactly what the tool_result chain produced, like pi does.
+		pi.sessionManager.appendMessage({
+			role: "toolResult", toolCallId: callId, toolName: "read", content: persisted, isError: false, timestamp: Date.now(),
+		} as never);
+		// The executed body in the persisted result satisfies residency: no queued copy flushes.
+		await pi.turnEnd();
+		expect(pi.sent).toHaveLength(0);
+		pi.setIdle(true);
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "already-resident" }],
+		});
+		expect(pi.sent).toHaveLength(0);
+		// Once the read result leaves the branch, the skill is offered again.
+		pi.sessionManager.branch(before);
+		await pi.tree();
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		expect(pi.sent).toHaveLength(1);
+		expect(pi.sent[0].content).toContain("Child instructions.");
+	} finally {
+		if (previous === undefined) delete process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+		else process.env.PI_TRUST_PROJECT_SKILL_SHELL = previous;
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test.each(["replaced", "incomplete", "error"] as const)("%s transformed results do not suppress the queued delivery", async (resultKind) => {
+	const previous = process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+	process.env.PI_TRUST_PROJECT_SKILL_SHELL = "1";
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-dynamic-replaced-")));
+	try {
+		const prefix = "---\nname: child\ndescription: child\n---\n\nChild instructions.\n\nBuild id: !`echo dyn-42`";
+		const tail = "Required final instructions.";
+		const path = writeSkill(root, "child", prefix + "\n" + tail);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		await pi.start();
+		pi.setIdle(false);
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		const callId = "call-read-1";
+		// The complete body spans text blocks. A later handler may retain the
+		// decorated first block while removing required instructions in the tail.
+		const result = await pi.emit("tool_result", {
+			type: "tool_result", toolCallId: callId, toolName: "read", input: { path },
+			content: [{ type: "text", text: prefix }, { type: "text", text: tail }], isError: false,
+		});
+		// SAFETY: tool_result is the registered delivery handler, which returns text blocks for this text-only fixture.
+		const delivered = result as { content: Array<{ type: "text"; text: string }> };
+		expect(textOf(delivered.content)).toContain("Build id: dyn-42");
+		expect(textOf(delivered.content)).toContain(tail);
+		const persisted = resultKind === "replaced"
+			? [{ type: "text" as const, text: "replaced by a later handler: body gone" }]
+			: resultKind === "incomplete" ? delivered.content.slice(0, 1) : delivered.content;
+		// Persist the final chain output, not the content our handler proposed.
+		pi.sessionManager.appendMessage({
+			role: "toolResult", toolCallId: callId, toolName: "read", content: persisted,
+			isError: resultKind === "error", timestamp: Date.now(),
+		});
+		await pi.turnEnd();
+		expect(pi.sent).toHaveLength(1);
+		expect(pi.sent[0].content).toContain("Child instructions.");
+		expect(pi.sent[0].content).toContain(tail);
+	} finally {
+		if (previous === undefined) delete process.env.PI_TRUST_PROJECT_SKILL_SHELL;
+		else process.env.PI_TRUST_PROJECT_SKILL_SHELL = previous;
+		rmSync(root, { recursive: true, force: true });
 	}
 });

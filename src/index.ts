@@ -396,7 +396,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (skills.length > 0) pi.sendMessage(inlineSkillMessage(skills), { triggerTurn: false });
 	}
 
-	if (pi.events) registerSkillApi(pi, () => catalog.skillList, deliverRequestedSkills);
+	registerSkillApi(pi, () => catalog.skillList, deliverRequestedSkills);
 
 		
 
