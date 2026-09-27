@@ -2,28 +2,41 @@ import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { SessionManager, createEventBus } from "@earendil-works/pi-coding-agent";
+import {
+	createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager,
+	type AgentSession, type EventBus, type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
+import { fauxAssistantMessage, fauxProvider, fauxToolCall, type FauxProviderHandle, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { AutocompleteProvider } from "@earendil-works/pi-tui";
 import extension from "../src/index";
-import { SKILL_API_CHANNEL, type SkillApiReply } from "../src/skill-events";
+import {
+	SKILL_API_CHANNEL, type SkillApiDeliverReply, type SkillApiProbeReply, type SkillApiSuggestReply,
+} from "../src/skill-events";
 
 const PARENT = `---\nname: parent\ndescription: parent\n---\n\nParent instructions. Read \`/skill:child\`.\n`;
 const CHILD = `---\nname: child\ndescription: child\n---\n\nChild instructions.\n`;
 
-test("probe detects absence and ignores unsupported versions regardless of load order", async () => {
+function writeSkill(root: string, name: string, text: string): string {
+	const path = join(root, ".pi/skills", name, "SKILL.md");
+	mkdirSync(dirname(path), { recursive: true });
+	writeFileSync(path, text);
+	return path;
+}
+
+test("probe detects absence, lists versions, and ignores unsupported versions regardless of load order", async () => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-events-")));
 	try {
 		const events = createEventBus();
-		let reply: SkillApiReply | undefined;
-		const probe = () => events.emit(SKILL_API_CHANNEL, { version: 1, operation: "probe", reply: (value: SkillApiReply) => { reply = value; } });
+		let reply: unknown;
+		const probe = () => events.emit(SKILL_API_CHANNEL, { version: 1, operation: "probe", reply: (value: SkillApiProbeReply) => { reply = value; } });
 		probe();
 		expect(reply).toBeUndefined();
 		const pi = fakePi(root, events);
 		extension(pi.api as never);
 		probe();
-		expect(reply).toEqual({ version: 1, operation: "probe", available: true });
+		expect(reply).toEqual({ version: 1, operation: "probe", available: true, versions: [1] });
 		reply = undefined;
-		events.emit(SKILL_API_CHANNEL, { version: 2, operation: "probe", reply: (value: SkillApiReply) => { reply = value; } });
+		events.emit(SKILL_API_CHANNEL, { version: 2, operation: "probe", reply: (value: unknown) => { reply = value; } });
 		expect(reply).toBeUndefined();
 	} finally {
 		rmSync(root, { recursive: true, force: true });
@@ -34,10 +47,11 @@ function fakePi(root: string, events = createEventBus()) {
 	const handlers = new Map<string, Array<(event: unknown, ctx: unknown) => Promise<unknown>>>();
 	const sessionManager = SessionManager.inMemory(root);
 	let providerFactory: ((current: AutocompleteProvider) => AutocompleteProvider) | undefined;
-	const ctx = { cwd: root, isProjectTrusted: () => true, hasUI: true, sessionManager, ui: {
+	let idle = true;
+	const ctx = { cwd: root, isProjectTrusted: () => true, isIdle: () => idle, hasUI: true, sessionManager, ui: {
 		addAutocompleteProvider: (factory: (current: AutocompleteProvider) => AutocompleteProvider) => { providerFactory = factory; },
 		getEditorComponent: () => true,
-	} }; 
+	} };
 	const sent: Array<{ content: string; details: { skills: Array<{ name: string }> }; options: unknown }> = [];
 	const api = {
 		events,
@@ -47,27 +61,62 @@ function fakePi(root: string, events = createEventBus()) {
 			sent.push({ ...message, options });
 		},
 	};
+	const emit = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); };
 	return {
 		api, events, sent, sessionManager,
+		setIdle: (value: boolean) => { idle = value; },
 		getProvider: () => providerFactory!({ getSuggestions: async () => null, applyCompletion: () => ({ lines: [], cursorLine: 0, cursorCol: 0 }) }),
-		start: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx); },
-		turnEnd: async () => { for (const handler of handlers.get("turn_end") ?? []) await handler({}, ctx); },
-		request: (operation: string, fields: object = {}): SkillApiReply | undefined => {
-			let reply: SkillApiReply | undefined;
-			events.emit(SKILL_API_CHANNEL, { version: 1, operation, ...fields, reply: (value: SkillApiReply) => { reply = value; } });
+		start: () => emit("session_start"),
+		turnEnd: () => emit("turn_end"),
+		request: (operation: string, fields: object = {}): unknown => {
+			let reply: unknown;
+			events.emit(SKILL_API_CHANNEL, { version: 1, operation, ...fields, reply: (value: unknown) => { reply = value; } });
 			return reply;
 		},
 	};
 }
 
-test("delivery uses inline blocks, references, and persisted session residency", async () => {
+test("malformed requests get no reply and send nothing", async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-malformed-")));
+	try {
+		writeSkill(root, "child", CHILD);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		await pi.start();
+		expect(pi.request("deliver")).toBeUndefined();
+		expect(pi.request("deliver", { names: ["child", 3] })).toBeUndefined();
+		expect(pi.request("suggest", { query: 3 })).toBeUndefined();
+		expect(pi.request("unknown-operation")).toBeUndefined();
+		let replied = false;
+		pi.events.emit(SKILL_API_CHANNEL, { version: 1, operation: "probe" });
+		pi.events.emit(SKILL_API_CHANNEL, { operation: "probe", reply: () => { replied = true; } });
+		expect(replied).toBe(false);
+		expect(pi.sent).toHaveLength(0);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("delivery before session_start reports every name unknown and sends nothing", async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-early-")));
+	try {
+		writeSkill(root, "child", CHILD);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		expect(pi.request("deliver", { names: ["child", "missing"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "unknown" }, { name: "missing", status: "unknown" }],
+		});
+		expect(pi.sent).toHaveLength(0);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("idle delivery uses inline blocks, references, and persisted session residency", async () => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-delivery-")));
 	try {
-		for (const [name, text] of [["parent", PARENT], ["child", CHILD]]) {
-			const path = join(root, ".pi/skills", name, "SKILL.md");
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, text);
-		}
+		writeSkill(root, "parent", PARENT);
+		writeSkill(root, "child", CHILD);
 		const pi = fakePi(root);
 		extension(pi.api as never);
 		await pi.start();
@@ -79,12 +128,12 @@ test("delivery uses inline blocks, references, and persisted session residency",
 			],
 		});
 		expect(pi.sent).toHaveLength(1);
-		expect(pi.sent[0].options).toEqual({ deliverAs: "steer" });
+		// Idle: Pi appends the message at once and starts no turn.
+		expect(pi.sent[0].options).toBeUndefined();
 		expect(pi.sent[0].details.skills.map((skill) => skill.name)).toEqual(["parent", "child"]);
 		expect(pi.sent[0].content).toContain(`<skill_dir>${join(root, ".pi/skills/parent")}</skill_dir>`);
 		expect(pi.sent[0].content).toContain(`<workspace_dir>${root}</workspace_dir>`);
-		// Pi persists the queued custom message after the tool result. A new
-		// request must detect this through the public session context APIs.
+		// A new request must detect the persisted message through the public session context APIs.
 		pi.sessionManager.appendCustomMessageEntry("skill", pi.sent[0].content, true, pi.sent[0].details);
 		expect(pi.request("deliver", { names: ["parent", "child"] })).toEqual({
 			version: 1, operation: "deliver", outcomes: [
@@ -98,21 +147,21 @@ test("delivery uses inline blocks, references, and persisted session residency",
 	}
 });
 
-test("a queued skill stays reserved after turn_end until Pi persists the steer message", async () => {
+test("a streaming delivery is sent at turn_end and stays reserved until Pi persists it", async () => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-pending-")));
 	try {
-		const path = join(root, ".pi/skills/child/SKILL.md");
-		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(path, CHILD);
+		writeSkill(root, "child", CHILD);
 		const pi = fakePi(root);
 		extension(pi.api as never);
 		await pi.start();
+		pi.setIdle(false);
 		expect(pi.request("deliver", { names: ["child"] })).toEqual({
 			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
 		});
+		expect(pi.sent).toHaveLength(0);
 		await pi.turnEnd();
-		// Another steer message may arrive first, so the skill remains queued
-		// while the real SessionManager still has no persisted skill message.
+		expect(pi.sent).toHaveLength(1);
+		expect(pi.sent[0].options).toEqual({ triggerTurn: false });
 		expect(pi.sessionManager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
 		expect(pi.request("deliver", { names: ["child"] })).toEqual({
 			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "already-resident" }],
@@ -125,25 +174,159 @@ test("a queued skill stays reserved after turn_end until Pi persists the steer m
 
 test("API suggestions rank exactly like the main editor provider", async () => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-suggest-")));
+	// Hermetic discovery: user-level skills must not leak into the result.
+	const previous = { HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+	process.env.HOME = join(root, "home");
+	process.env.PI_CODING_AGENT_DIR = join(root, "agent");
 	try {
+		const cwd = join(root, "workspace");
 		for (const name of ["alpha", "alpine", "beta"]) {
-			const path = join(root, ".pi/skills", name, "SKILL.md");
-			mkdirSync(dirname(path), { recursive: true });
-			writeFileSync(path, `---\nname: ${name}\ndescription: sample\n---\n\n${name} instructions.\n`);
+			writeSkill(cwd, name, `---\nname: ${name}\ndescription: sample\n---\n\n${name} instructions.\n`);
 		}
-		const pi = fakePi(root);
+		const pi = fakePi(cwd);
 		extension(pi.api as never);
 		await pi.start();
 		const provider = pi.getProvider();
 		const main = await provider.getSuggestions(["use /skill:al"], 0, 13, { signal: new AbortController().signal });
-		const result = pi.request("suggest", { query: "skill:al" });
-		expect(result).toEqual({ version: 1, operation: "suggest", items: main?.items });
-		expect((result as { items: Array<{ value: string }> }).items.map((item) => item.value)).toContain("skill:alpha");
+		const result = pi.request("suggest", { query: "skill:al" }) as SkillApiSuggestReply;
+		expect(result).toEqual({ version: 1, operation: "suggest", items: main!.items });
+		expect(result.items.map((item) => item.value).sort()).toEqual(["skill:alpha", "skill:alpine"]);
 		const all = await provider.getSuggestions(["use /"], 0, "use /".length, { signal: new AbortController().signal });
-		const empty = pi.request("suggest", { query: "" });
-		expect(empty).toEqual({ version: 1, operation: "suggest", items: all?.items });
-		expect((empty as { items: Array<{ value: string }> }).items.length).toBeGreaterThan(3);
+		const empty = pi.request("suggest", { query: "" }) as SkillApiSuggestReply;
+		expect(empty).toEqual({ version: 1, operation: "suggest", items: all!.items });
+		expect(empty.items.map((item) => item.value).sort()).toEqual(["skill:alpha", "skill:alpine", "skill:beta"]);
 	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Real Pi session: exactly-once delivery through Pi's own agent loop and queues.
+// Only the model is faux; the extension, event bus, session, and tools are real.
+// ---------------------------------------------------------------------------
+
+const MARKER = "UNIQUE_API_SKILL_MARKER";
+
+type RealSession = {
+	session: AgentSession;
+	faux: FauxProviderHandle;
+	requests: TranscriptContext[];
+	skillPath: string;
+	deliver: () => SkillApiDeliverReply | undefined;
+	cleanup: () => void;
+};
+
+async function realSession(): Promise<RealSession> {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-real-")));
+	const agentDir = join(root, "agent");
+	const cwd = join(root, "workspace");
+	mkdirSync(cwd, { recursive: true });
+	const skillPath = writeSkill(cwd, "api-skill", `---\nname: api-skill\ndescription: API fixture\n---\n\n${MARKER} instructions.\n`);
+	const previous = { HOME: process.env.HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, PI_BETTER_SKILLS_NO_PI_DOCS: process.env.PI_BETTER_SKILLS_NO_PI_DOCS };
+	process.env.HOME = join(root, "home");
+	process.env.PI_CODING_AGENT_DIR = agentDir;
+	process.env.PI_BETTER_SKILLS_NO_PI_DOCS = "1";
+	let session: AgentSession | undefined;
+	const cleanup = () => {
+		try {
+			session?.dispose();
+			rmSync(root, { recursive: true, force: true });
+		} finally {
+			for (const [key, value] of Object.entries(previous)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	};
+	try {
+		let events: EventBus | undefined;
+		const deliver = () => {
+			let reply: SkillApiDeliverReply | undefined;
+			events!.emit(SKILL_API_CHANNEL, { version: 1, operation: "deliver", names: ["api-skill"], reply: (value: SkillApiDeliverReply) => { reply = value; } });
+			return reply;
+		};
+		// A consumer extension whose tool asks this extension to deliver the skill.
+		const consumer = (pi: ExtensionAPI) => {
+			events = pi.events;
+			pi.registerTool({
+				name: "deliver_skill", label: "deliver_skill", description: "Deliver api-skill", parameters: { type: "object", properties: {} } as never,
+				execute: async () => ({ content: [{ type: "text", text: JSON.stringify(deliver()) }], details: {} }),
+			});
+		};
+		const faux = fauxProvider();
+		const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+		runtime.registerNativeProvider(faux.provider);
+		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" });
+		const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, noContextFiles: true, noPromptTemplates: true, noThemes: true, extensionFactories: [extension, consumer] });
+		await loader.reload();
+		const { session: created } = await createAgentSession({ cwd, agentDir, settingsManager, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd), modelRuntime: runtime, model: faux.getModel(), thinkingLevel: "off", tools: ["read", "deliver_skill"] });
+		session = created;
+		const errors: unknown[] = [];
+		await created.bindExtensions({ onError: (error) => errors.push(error) });
+		const requests: TranscriptContext[] = [];
+		return {
+			session: created, faux, requests, skillPath, deliver,
+			cleanup: () => {
+				try { expect(errors).toEqual([]); } finally { cleanup(); }
+			},
+		};
+	} catch (error) {
+		try { cleanup(); } finally { throw error; }
+	}
+}
+
+/** Model-visible copies of the skill body in one provider request. */
+function bodyCopies(context: TranscriptContext): number {
+	return JSON.stringify(context.messages).split(`${MARKER} instructions.`).length - 1;
+}
+
+test("an API skill requested during an aborted response is delivered exactly once (real Pi loop)", async () => {
+	const built = await realSession();
+	try {
+		built.faux.setResponses([
+			() => {
+				// Another extension asks for the skill while the response streams; the user then aborts.
+				// An explicit abort stops Pi from draining its steering queue in this run.
+				expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "delivered" }]);
+				void built.session.abort();
+				return fauxAssistantMessage("partial");
+			},
+			(context) => { built.requests.push(structuredClone(context)); return fauxAssistantMessage("OK"); },
+		]);
+		await built.session.prompt("first");
+		// Idle again: a repeat request must not submit a second copy.
+		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "already-resident" }]);
+		await built.session.prompt("second");
+		expect(built.requests).toHaveLength(1);
+		expect(bodyCopies(built.requests[0])).toBe(1);
+	} finally {
+		built.cleanup();
+	}
+});
+
+test.each([
+	{ label: "alone", siblingRead: false },
+	{ label: "with a parallel sibling read of SKILL.md", siblingRead: true },
+])("a tool-call delivery $label reaches the next response once (real Pi loop)", async ({ siblingRead }) => {
+	const built = await realSession();
+	try {
+		built.faux.setResponses([
+			() => fauxAssistantMessage([
+				fauxToolCall("deliver_skill", {}),
+				...(siblingRead ? [fauxToolCall("read", { path: built.skillPath })] : []),
+			]),
+			(context) => { built.requests.push(structuredClone(context)); return fauxAssistantMessage("OK"); },
+		]);
+		await built.session.prompt("load the skill");
+		expect(built.requests).toHaveLength(1);
+		expect(bodyCopies(built.requests[0])).toBe(1);
+		// The skill stays resident for later requests.
+		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "already-resident" }]);
+	} finally {
+		built.cleanup();
 	}
 });

@@ -71,28 +71,29 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		return true;
 	}
 
-	/** A steer message is persisted after turn_end, not alongside the tool result. */
+	/**
+	 * An API delivery owns its reservation until its skill message persists or
+	 * the session is replaced. Turn, run, compaction, and tree resets keep it:
+	 * the message can still be waiting in Pi's pending queue at those points.
+	 */
 	function reserveQueued(name: string): boolean {
 		if (!reserve(name)) return false;
 		queuedSkillNames.add(name);
 		return true;
 	}
 
+	function isQueued(name: string): boolean {
+		return queuedSkillNames.has(name);
+	}
+
 	function releaseSkills(names: Iterable<string>): void {
 		for (const name of names) reservedSkillNames.delete(name);
 	}
 
-	function releaseTurn(): void {
-		// Pi polls steering after turn_end. Keep those reservations until the
-		// queued message persists or agent_end ends the run.
-		reservationsByToolCall = new Map();
-		reservedSkillNames = new Set(queuedSkillNames);
-	}
-
+	/** Release transient tool-result reservations; API deliveries keep theirs (see reserveQueued). */
 	function releaseAll(): void {
 		reservationsByToolCall = new Map();
-		reservedSkillNames = new Set();
-		queuedSkillNames = new Set();
+		reservedSkillNames = new Set(queuedSkillNames);
 	}
 
 	function releaseToolCall(toolCallId: string): void {
@@ -112,6 +113,7 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	}
 
 	function clear(): void {
+		queuedSkillNames = new Set();
 		releaseAll();
 		injectedSkillNames = new Set();
 		activeSkill = undefined;
@@ -197,8 +199,8 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		hasKnown,
 		reserve,
 		reserveQueued,
+		isQueued,
 		releaseSkills,
-		releaseTurn,
 		releaseAll,
 		releaseToolCall,
 		persistReservations,

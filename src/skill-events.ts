@@ -1,19 +1,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillSuggestions, type SkillAutocompleteSkill } from "./skill-autocomplete";
 
-export const SKILL_API_CHANNEL = "pi-better-skills/v1/request";
+/** Stable channel. The protocol version travels in the payload (see README "For extension authors"). */
+export const SKILL_API_CHANNEL = "pi-better-skills:request";
 export const SKILL_API_VERSION = 1;
+/** Every payload version this provider answers; the probe reply lists them. */
+export const SKILL_API_VERSIONS: readonly number[] = [SKILL_API_VERSION];
 
-export type SkillDeliveryOutcome = { name: string; status: "delivered" | "already-resident" | "unknown" };
-export type SkillApiReply =
-	| { version: 1; operation: "probe"; available: true }
-	| { version: 1; operation: "suggest"; items: Array<{ value: string; label: string }> }
-	| { version: 1; operation: "deliver"; outcomes: SkillDeliveryOutcome[] };
+export type SkillDeliveryStatus = "delivered" | "already-resident" | "unknown";
+export type SkillDeliveryOutcome = { name: string; status: SkillDeliveryStatus };
+export type SkillSuggestion = { value: string; label: string };
 
-export type SkillApiRequest =
-	| { version: 1; operation: "probe"; reply: (result: SkillApiReply) => void }
-	| { version: 1; operation: "suggest"; query: string; reply: (result: SkillApiReply) => void }
-	| { version: 1; operation: "deliver"; names: string[]; reply: (result: SkillApiReply) => void };
+export type SkillApiProbeReply = { version: 1; operation: "probe"; available: true; versions: number[] };
+export type SkillApiSuggestReply = { version: 1; operation: "suggest"; items: SkillSuggestion[] };
+export type SkillApiDeliverReply = { version: 1; operation: "deliver"; outcomes: SkillDeliveryOutcome[] };
+
+export type SkillApiProbeRequest = { version: 1; operation: "probe"; reply: (result: SkillApiProbeReply) => void };
+export type SkillApiSuggestRequest = { version: 1; operation: "suggest"; query: string; reply: (result: SkillApiSuggestReply) => void };
+export type SkillApiDeliverRequest = { version: 1; operation: "deliver"; names: string[]; reply: (result: SkillApiDeliverReply) => void };
+export type SkillApiRequest = SkillApiProbeRequest | SkillApiSuggestRequest | SkillApiDeliverRequest;
 
 function isRequest(value: unknown): value is SkillApiRequest {
 	if (!value || typeof value !== "object") return false;
@@ -37,7 +42,7 @@ export function registerSkillApi(
 		if (!isRequest(value)) return;
 		switch (value.operation) {
 			case "probe":
-				value.reply({ version: 1, operation: "probe", available: true });
+				value.reply({ version: 1, operation: "probe", available: true, versions: [...SKILL_API_VERSIONS] });
 				break;
 			case "suggest":
 				value.reply({ version: 1, operation: "suggest", items: skillSuggestions(value.query, getSkills()) });

@@ -35,41 +35,6 @@ New sessions load it automatically. Existing sessions need:
 /reload
 ```
 
-## Public API for extensions
-
-Extensions can use Pi's shared `pi.events` bus without importing this package. API v1 uses the channel `pi-better-skills/v1/request`. Every request and reply has `version: 1`. Requests use an `operation` and a `reply` callback:
-
-| Operation | Request fields | Reply fields |
-| --- | --- | --- |
-| `probe` | none | `available: true` |
-| `suggest` | `query: string` (skill name query, optionally prefixed with `skill:`) | `items: { value: string; label: string }[]` in main-editor ranking order; values are `skill:<name>` |
-| `deliver` | `names: string[]` (skill names, not tokens) | `outcomes: { name: string; status: "delivered" \| "already-resident" \| "unknown" }[]` in request order |
-
-A probe replies synchronously when this extension is present, including when the consumer loads later. No reply means absent or unsupported version. Unsupported versions and malformed requests receive no reply. Probe before delivery to choose a fallback; do not rely on a load-time broadcast. Suggestions also reply synchronously. Delivery includes `<skill_context>` and referenced skills, and skips bodies already present in the active session branch. During a running tool call, Pi queues one skill message for an agent continuation after the current tool result; it does not modify that result. When the agent is idle, Pi persists the message immediately and starts no turn; the model sees it on the next prompt. A `delivered` outcome means the message was submitted to Pi for delivery: queued while running, or submitted for immediate persistence while idle. Consumers must not inject the same body in their own tool result.
-
-```ts
-const channel = "pi-better-skills/v1/request";
-let available = false;
-pi.events.emit(channel, {
-  version: 1, operation: "probe",
-  reply: (result: { version: number; operation: string; available?: boolean }) => {
-    available = result.version === 1 && result.operation === "probe" && result.available === true;
-  },
-});
-if (available) {
-  pi.events.emit(channel, {
-    version: 1, operation: "deliver", names: ["my-skill"],
-    reply: (result) => { /* inspect outcomes */ },
-  });
-  pi.events.emit(channel, {
-    version: 1, operation: "suggest", query: "my-",
-    reply: (result) => { /* show result.items in your editor */ },
-  });
-} else {
-  // Use your fallback skill delivery and completion provider.
-}
-```
-
 ## What it solves
 
 ### Skills can bundle real tools
@@ -446,3 +411,69 @@ export PI_TRUST_PROJECT_SKILL_SHELL=1
 ```
 
 Only do this in repositories you trust.
+
+## For extension authors
+
+Other extensions can ask this extension to suggest and deliver skills. They use Pi's shared `pi.events` bus, so they do not import this package.
+
+### Protocol
+
+- **Channel:** `pi-better-skills:request`. The channel name does not change between versions.
+- **Version:** every request and reply carries `version: 1`. This extension ignores a request with a version that it does not support.
+- **Replies:** each request carries a `reply` callback. This extension calls it synchronously, before `pi.events.emit` returns.
+- **No reply:** a malformed request, an unsupported version, or a handler error gets no reply. A missing reply also means that this extension is not installed.
+- **Compatibility rule:** new optional reply fields and new operations do not change the version. A change that removes or renames a field, changes a field type or meaning, or changes an outcome status bumps the version. This extension keeps answering every version listed in the probe reply `versions`.
+
+### Operations
+
+- **`probe`**: confirms that this extension is loaded and lists the supported `versions`. Probe once before other requests. A probe reply proves that the bus delivers replies synchronously. Without that proof, a late `deliver` reply could arrive after your fallback already injected the same skill, and the model would get the body twice. If the probe gets no reply, do not send `deliver` or `suggest`; use your fallback. If the reply does not list version 1, the installed provider is too new for your consumer.
+- **`suggest`**: returns skill completions for a query, optionally prefixed with `skill:`. The order is the same ranking as the main editor. Each `value` is `skill:<name>`.
+- **`deliver`**: sends skill bodies to the model as one `skill` message. The message includes `<skill_context>` and the skills that each body references. Outcomes follow request order:
+  - `delivered`: this extension accepted the skill and owns its delivery.
+  - `already-resident`: the body is already in the active session branch, or an earlier delivery is still pending.
+  - `unknown`: this extension did not deliver the skill. The cause can be that no session has started yet, that the skill does not exist, or that its `SKILL.md` body is unreadable. Use your fallback for that name.
+
+Do not also put a `delivered` body in your own tool result.
+
+### Delivery timing
+
+- **Idle agent:** Pi appends the message to the session at once and starts no turn. The model sees it with the next prompt.
+- **Running agent (for example, during your tool call):** this extension holds the message until the current turn ends, after all tool results of that turn are stored. Then Pi appends it. The next response in the same run sees it. If the run ends first, the model sees it with the next prompt. The message never modifies your tool result.
+- If a parallel tool in the same turn already returns the same `SKILL.md`, this extension drops the queued copy, so the model gets one body.
+
+### Types
+
+```ts
+type SkillDeliveryStatus = "delivered" | "already-resident" | "unknown";
+
+type ProbeReply = { version: 1; operation: "probe"; available: true; versions: number[] };
+type SuggestReply = { version: 1; operation: "suggest"; items: { value: string; label: string }[] };
+type DeliverReply = { version: 1; operation: "deliver"; outcomes: { name: string; status: SkillDeliveryStatus }[] };
+
+type ProbeRequest = { version: 1; operation: "probe"; reply: (result: ProbeReply) => void };
+type SuggestRequest = { version: 1; operation: "suggest"; query: string; reply: (result: SuggestReply) => void };
+type DeliverRequest = { version: 1; operation: "deliver"; names: string[]; reply: (result: DeliverReply) => void };
+```
+
+### Example
+
+```ts
+const SKILLS_CHANNEL = "pi-better-skills:request";
+
+function skillProviderAvailable(pi: ExtensionAPI): boolean {
+  let reply: ProbeReply | undefined;
+  const request: ProbeRequest = { version: 1, operation: "probe", reply: (result) => { reply = result; } };
+  pi.events.emit(SKILLS_CHANNEL, request);
+  return reply?.versions.includes(1) === true;
+}
+
+function deliverSkills(pi: ExtensionAPI, names: string[]): DeliverReply["outcomes"] | undefined {
+  if (!skillProviderAvailable(pi)) return undefined; // use your fallback delivery
+  let reply: DeliverReply | undefined;
+  const request: DeliverRequest = { version: 1, operation: "deliver", names, reply: (result) => { reply = result; } };
+  pi.events.emit(SKILLS_CHANNEL, request);
+  return reply?.outcomes;
+}
+```
+
+Import `ExtensionAPI` from `@earendil-works/pi-coding-agent` and copy the types above. A `suggest` request follows the same pattern with `SuggestRequest`.
