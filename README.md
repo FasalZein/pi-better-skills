@@ -431,14 +431,16 @@ Other extensions can ask this extension to suggest and deliver skills. They use 
 - **`deliver`**: sends skill bodies to the model as one `skill` message. The message includes `<skill_context>` and the skills that each body references. Outcomes follow request order:
   - `delivered`: this extension accepted the skill and owns its delivery.
   - `already-resident`: the body is already in the active session branch, or an earlier delivery is still pending.
-  - `unknown`: this extension did not deliver the skill. The cause can be that no session has started yet, that the skill does not exist, or that its `SKILL.md` body is unreadable. Use your fallback for that name.
+  - `unknown`: this extension did not deliver the skill. The cause can be that no session has started yet, that the call has unsupported timing (see below), that the skill does not exist, or that its `SKILL.md` body is unreadable. Use your fallback for that name.
 
 Do not also put a `delivered` body in your own tool result.
 
 ### Delivery timing
 
+- **Supported:** call `deliver` from a tool's `execute()` or while the agent is idle.
+- **Unsupported:** a call from a `turn_end` handler that runs after this extension's handler, or from an `agent_end` handler, gets `unknown` for every name and sends nothing. At that point this extension has already sent the turn's skills, so a later message would reach the model one turn late.
 - **Idle agent:** Pi appends the message to the session at once and starts no turn. The model sees it with the next prompt.
-- **Running agent (for example, during your tool call):** this extension holds the message until the current turn ends, after all tool results of that turn are stored. Then Pi appends it. The next response in the same run sees it. If the run ends first, the model sees it with the next prompt. The message never modifies your tool result.
+- **Running agent (during your tool call):** this extension holds the message until the current turn ends, after all tool results of that turn are stored. Then Pi appends it. The next response in the same run sees it. If the run ends after that turn, the message is already stored and the model sees it with the next prompt. The message never modifies your tool result.
 - If a parallel tool in the same turn already returns the same `SKILL.md`, this extension drops the queued copy, so the model gets one body.
 
 ### Types

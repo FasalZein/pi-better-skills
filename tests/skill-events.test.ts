@@ -71,6 +71,7 @@ function fakePi(root: string, events = createEventBus()) {
 		start: () => emit("session_start"),
 		tree: () => emit("session_tree"),
 		turnEnd: () => emit("turn_end"),
+		turnStart: () => emit("turn_start"),
 		request: (operation: string, fields: object = {}): unknown => {
 			let reply: unknown;
 			events.emit(SKILL_API_CHANNEL, { version: 1, operation, ...fields, reply: (value: unknown) => { reply = value; } });
@@ -189,6 +190,8 @@ test("a streaming delivery is sent at turn_end and stays reserved until Pi persi
 		expect(pi.sent).toHaveLength(1);
 		expect(pi.sent[0].options).toEqual({ triggerTurn: false });
 		expect(pi.sessionManager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
+		// Next turn, before Pi stores the message: still reserved.
+		await pi.turnStart();
 		expect(pi.request("deliver", { names: ["child"] })).toEqual({
 			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "already-resident" }],
 		});
@@ -246,7 +249,7 @@ type RealSession = {
 	cleanup: () => void;
 };
 
-async function realSession(): Promise<RealSession> {
+async function realSession(hookEvent?: "turn_end" | "agent_end", hookOutcomes: unknown[] = []): Promise<RealSession> {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-real-")));
 	const agentDir = join(root, "agent");
 	const cwd = join(root, "workspace");
@@ -282,6 +285,8 @@ async function realSession(): Promise<RealSession> {
 				name: "deliver_skill", label: "deliver_skill", description: "Deliver api-skill", parameters: { type: "object", properties: {} } as never,
 				execute: async () => ({ content: [{ type: "text", text: JSON.stringify(deliver()) }], details: {} }),
 			});
+			// Registered after the provider, so this handler runs after its turn_end flush.
+			if (hookEvent) pi.on(hookEvent, async () => { hookOutcomes.push(deliver()?.outcomes); });
 		};
 		const faux = fauxProvider();
 		const runtime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
@@ -352,6 +357,29 @@ test.each([
 		expect(bodyCopies(built.requests[0])).toBe(1);
 		// The skill stays resident for later requests.
 		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "already-resident" }]);
+	} finally {
+		built.cleanup();
+	}
+});
+
+test.each(["turn_end", "agent_end"] as const)("deliver from a later extension's %s handler is rejected as unknown (real Pi loop)", async (hookEvent) => {
+	const outcomes: unknown[] = [];
+	const built = await realSession(hookEvent, outcomes);
+	try {
+		built.faux.setResponses([
+			() => fauxAssistantMessage([fauxToolCall("read", { path: join(built.session.sessionManager.getCwd(), "missing.txt") })]),
+			(context) => { built.requests.push(structuredClone(context)); return fauxAssistantMessage("OK"); },
+			(context) => { built.requests.push(structuredClone(context)); return fauxAssistantMessage("OK"); },
+		]);
+		await built.session.prompt("first");
+		expect(outcomes.length).toBeGreaterThan(0);
+		for (const outcome of outcomes) expect(outcome).toEqual([{ name: "api-skill", status: "unknown" }]);
+		// Nothing was sent: no stored skill message, and the next prompt carries no body.
+		expect(built.session.sessionManager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
+		await built.session.prompt("second");
+		expect(built.requests.every((request) => bodyCopies(request) === 0)).toBe(true);
+		// Idle delivery still works afterwards.
+		expect(built.deliver()?.outcomes).toEqual([{ name: "api-skill", status: "delivered" }]);
 	} finally {
 		built.cleanup();
 	}

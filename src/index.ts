@@ -343,15 +343,21 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// API deliveries requested while Pi streams wait for turn_end, after the
 	// turn's sibling tool results have persisted (see deliverRequestedSkills).
 	let pendingApiSkills: InlineSkillDisplay[] = [];
+	// Set by this extension's turn_end flush; cleared at the next agent_start or
+	// turn_start. Pi emits every agent_end after a turn_end with no turn_start
+	// between (agent-loop.js), so a running-agent request while this is set comes
+	// from a later turn_end handler or from agent_end: too late for this turn.
+	let turnFlushed = false;
 
 	/**
 	 * Public API delivery. Idle: Pi appends the message at once and starts no
 	 * turn. Streaming: the batch waits for turn_end, so a parallel sibling tool
 	 * that returns the same SKILL.md cannot add a second body behind a queued one.
+	 * Unsupported timing (no session, or after this turn's flush) gets `unknown`.
 	 */
 	function deliverRequestedSkills(names: string[]): SkillDeliveryOutcome[] {
 		const ctx = apiContext;
-		if (!ctx) return names.map((name) => ({ name, status: "unknown" }));
+		if (!ctx || (turnFlushed && !ctx.isIdle())) return names.map((name) => ({ name, status: "unknown" }));
 		residency.reconcile(ctx);
 		const outcomes: SkillDeliveryOutcome[] = [];
 		const staged = residency.stagedNames;
@@ -383,10 +389,11 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	}
 
 	/** Send streaming API deliveries that no persisted result has supplied meanwhile. */
-	function flushPendingApiSkills(options: { triggerTurn: false } | { deliverAs: "nextTurn" }): void {
+	function flushPendingApiSkills(): void {
+		turnFlushed = true;
 		const skills = pendingApiSkills.filter((skill) => residency.isQueued(skill.name));
 		pendingApiSkills = [];
-		if (skills.length > 0) pi.sendMessage(inlineSkillMessage(skills), options);
+		if (skills.length > 0) pi.sendMessage(inlineSkillMessage(skills), { triggerTurn: false });
 	}
 
 	if (pi.events) registerSkillApi(pi, () => catalog.skillList, deliverRequestedSkills);
@@ -565,13 +572,23 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	});
 
 
+	pi.on("agent_start", async () => {
+		turnFlushed = false;
+	});
+
+	pi.on("turn_start", async () => {
+		turnFlushed = false;
+	});
+
 	pi.on("turn_end", async (_event, ctx) => {
 		if (!sessionInitialized) return;
 		residency.reconcile(ctx);
 		// Extension turn_end handlers run before Pi's own turn_end processing,
 		// which appends messages sent with triggerTurn: false. The message then
 		// persists in this turn even when the run ends or is aborted here.
-		flushPendingApiSkills({ triggerTurn: false });
+		// A supported request (tool execute, streaming response) always precedes
+		// this flush, so nothing stays pending at agent_end.
+		flushPendingApiSkills();
 		residency.releaseAll();
 		firstRead.settle();
 	});
@@ -723,8 +740,6 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	// tool_result handler returns, so nothing can switch models after this.
 	pi.on("agent_end", async (_event, ctx) => {
 		if (sessionInitialized) residency.reconcile(ctx);
-		// A request after the last turn_end rides with the next prompt.
-		flushPendingApiSkills({ deliverAs: "nextTurn" });
 		residency.releaseAll();
 		firstRead.settle();
 		await restoreOriginalState(ctx);
