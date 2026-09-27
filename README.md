@@ -35,6 +35,41 @@ New sessions load it automatically. Existing sessions need:
 /reload
 ```
 
+## Public API for extensions
+
+Extensions can use Pi's shared `pi.events` bus without importing this package. API v1 uses the channel `pi-better-skills/v1/request`. Every request and reply has `version: 1`. Requests use an `operation` and a `reply` callback:
+
+| Operation | Request fields | Reply fields |
+| --- | --- | --- |
+| `probe` | none | `available: true` |
+| `suggest` | `query: string` (skill name query, optionally prefixed with `skill:`) | `items: { value: string; label: string }[]` in main-editor ranking order; values are `skill:<name>` |
+| `deliver` | `names: string[]` (skill names, not tokens) | `outcomes: { name: string; status: "delivered" \| "already-resident" \| "unknown" }[]` in request order |
+
+A probe replies synchronously when this extension is present, including when the consumer loads later. No reply means absent or unsupported version. Unsupported versions and malformed requests receive no reply. Probe before delivery to choose a fallback; do not rely on a load-time broadcast. Suggestions also reply synchronously. Delivery queues one skill message for the next agent continuation after the current tool result; it does not modify that tool result. It includes `<skill_context>` and referenced skills, and skips bodies already present in the active session branch. During a running tool call, Pi's steer queue carries this message after the result. A `delivered` outcome means queued, not yet persisted; consumers must not inject the same body in their own tool result.
+
+```ts
+const channel = "pi-better-skills/v1/request";
+let available = false;
+pi.events.emit(channel, {
+  version: 1, operation: "probe",
+  reply: (result: { version: number; operation: string; available?: boolean }) => {
+    available = result.version === 1 && result.operation === "probe" && result.available === true;
+  },
+});
+if (available) {
+  pi.events.emit(channel, {
+    version: 1, operation: "deliver", names: ["my-skill"],
+    reply: (result) => { /* inspect outcomes */ },
+  });
+  pi.events.emit(channel, {
+    version: 1, operation: "suggest", query: "my-",
+    reply: (result) => { /* show result.items in your editor */ },
+  });
+} else {
+  // Use your fallback skill delivery and completion provider.
+}
+```
+
 ## What it solves
 
 ### Skills can bundle real tools

@@ -11,6 +11,7 @@ import { createSkillDelivery, insertSkillContext, type DeliveryEvent } from "./s
 import { createSkillFirstRead } from "./skill-first-read";
 import { collectSkillReferences, hasResolvableReference, neutralizeDynamicPlaceholders, type RefDeps } from "./skill-refs";
 import { setupSkillAutocomplete } from "./skill-autocomplete";
+import { registerSkillApi, type SkillDeliveryOutcome } from "./skill-events";
 
 export { cliSkillPaths, cliSkillsOnly, resultConfirmsSkillBody } from "./skill-catalog";
 
@@ -338,6 +339,51 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	const delivery = createSkillDelivery({ catalog, residency, applyOverrides: applySkillOverrides });
 	const firstRead = createSkillFirstRead(catalog);
 	let sessionInitialized = false;
+	let apiContext: ExtensionContext | undefined;
+
+	if (pi.events) registerSkillApi(pi, () => catalog.skillList, (names): SkillDeliveryOutcome[] => {
+		const ctx = apiContext;
+		if (!ctx) return names.map((name) => ({ name, status: "unknown" }));
+		residency.reconcile(ctx);
+		const outcomes: SkillDeliveryOutcome[] = [];
+		const staged = residency.stagedNames;
+		const direct: InlineSkillDisplay[] = [];
+		for (const name of names) {
+			const skill = catalog.skills.get(name);
+			const doc = skill && skillDocument(skill.filePath);
+			if (!doc || !/^[A-Za-z0-9._-]+$/.test(name)) {
+				outcomes.push({ name, status: "unknown" });
+			} else if (staged.has(name)) {
+				outcomes.push({ name, status: "already-resident" });
+			} else {
+				// Use the same extraction/decorating path as an inline /skill: invocation.
+				const extracted = extractInlineSkillDisplays(
+					`/skill:${name}`,
+					(candidate) => catalog.skills.get(candidate),
+					() => neutralizeDynamicPlaceholders(doc.body),
+					(body, record) => insertSkillContext(body, record, ctx.cwd),
+					{ includeLeading: true },
+				);
+				if (!extracted?.skills.length) {
+					outcomes.push({ name, status: "unknown" });
+					continue;
+				}
+				outcomes.push({ name, status: "delivered" });
+				staged.add(name);
+				direct.push(...extracted.skills);
+			}
+		}
+		if (direct.length) {
+			const batch = commitRefExpansion(direct, delivery.refDeps(ctx.cwd), staged);
+			const accepted = batch.filter((skill) => residency.reserve(skill.name));
+			if (accepted.length) {
+				// During a tool call, Pi queues steer messages after the tool result.
+				// One batch keeps parent and references in the same continuation.
+				pi.sendMessage({ customType: "skill", content: inlineSkillsIntoText("", accepted), display: true, details: { skills: accepted } }, { deliverAs: "steer" });
+			}
+		}
+		return outcomes;
+	});
 
 		
 
@@ -481,6 +527,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		sessionInitialized = true;
+		apiContext = ctx;
 		residency.clear();
 		await catalog.bootstrap(ctx.cwd, ctx.isProjectTrusted());
 		residency.reconcile(ctx);
@@ -504,6 +551,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		sessionInitialized = false;
+		apiContext = undefined;
 		residency.clear();
 		firstRead.clear();
 	});
