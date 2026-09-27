@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { skillSuggestions, type SkillAutocompleteSkill } from "./skill-autocomplete";
 
-/** Stable channel. The protocol version travels in the payload (see README "For extension authors"). */
+/** API for other extensions: emit `{ version: 1, operation, ..., reply }` here; no probe reply means absent. */
 export const SKILL_API_CHANNEL = "pi-better-skills:request";
 export const SKILL_API_VERSION = 1;
 /** Every payload version this provider answers; the probe reply lists them. */
