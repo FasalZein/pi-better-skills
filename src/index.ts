@@ -373,8 +373,12 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		if (direct.length === 0) return outcomes;
 		const batch = commitRefExpansion(direct, delivery.refDeps(ctx.cwd), staged);
 		for (const skill of batch) residency.reserveQueued(skill.name);
-		if (ctx.isIdle()) pi.sendMessage(inlineSkillMessage(batch));
-		else pendingApiSkills.push(...batch);
+		if (ctx.isIdle()) {
+			pi.sendMessage(inlineSkillMessage(batch));
+			// Idle, Pi appends the entry before sendMessage returns. Reconcile now so the
+			// stored body releases the queued reservation before any tree navigation.
+			residency.reconcile(ctx);
+		} else pendingApiSkills.push(...batch);
 		return outcomes;
 	}
 

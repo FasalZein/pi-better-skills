@@ -59,6 +59,8 @@ function fakePi(root: string, events = createEventBus()) {
 		registerMessageRenderer: () => {},
 		sendMessage: (message: { content: string; details: { skills: Array<{ name: string }> } }, options: unknown) => {
 			sent.push({ ...message, options });
+			// Like pi's idle sendCustomMessage path: the entry is appended before sendMessage returns.
+			if (idle && options === undefined) sessionManager.appendCustomMessageEntry("skill", message.content, true, message.details);
 		},
 	};
 	const emit = async (name: string) => { for (const handler of handlers.get(name) ?? []) await handler({}, ctx); };
@@ -67,6 +69,7 @@ function fakePi(root: string, events = createEventBus()) {
 		setIdle: (value: boolean) => { idle = value; },
 		getProvider: () => providerFactory!({ getSuggestions: async () => null, applyCompletion: () => ({ lines: [], cursorLine: 0, cursorCol: 0 }) }),
 		start: () => emit("session_start"),
+		tree: () => emit("session_tree"),
 		turnEnd: () => emit("turn_end"),
 		request: (operation: string, fields: object = {}): unknown => {
 			let reply: unknown;
@@ -134,7 +137,6 @@ test("idle delivery uses inline blocks, references, and persisted session reside
 		expect(pi.sent[0].content).toContain(`<skill_dir>${join(root, ".pi/skills/parent")}</skill_dir>`);
 		expect(pi.sent[0].content).toContain(`<workspace_dir>${root}</workspace_dir>`);
 		// A new request must detect the persisted message through the public session context APIs.
-		pi.sessionManager.appendCustomMessageEntry("skill", pi.sent[0].content, true, pi.sent[0].details);
 		expect(pi.request("deliver", { names: ["parent", "child"] })).toEqual({
 			version: 1, operation: "deliver", outcomes: [
 				{ name: "parent", status: "already-resident" },
@@ -142,6 +144,30 @@ test("idle delivery uses inline blocks, references, and persisted session reside
 			],
 		});
 		expect(pi.sent).toHaveLength(1);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("an idle delivery does not stay reserved on a branch without its message", async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-idle-tree-")));
+	try {
+		writeSkill(root, "child", CHILD);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		await pi.start();
+		const before = pi.sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		// Navigate to a branch point before the stored skill message.
+		pi.sessionManager.branch(before);
+		await pi.tree();
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		expect(pi.sent).toHaveLength(2);
+		expect(pi.sent[1].content).toContain("Child instructions.");
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
