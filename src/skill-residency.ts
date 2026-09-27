@@ -54,6 +54,7 @@ function residencyMessage(message: SessionContextMessage): ResidencyMessage | un
 export function createSkillResidency(catalog: SkillCatalog) {
 	let injectedSkillNames = new Set<string>();
 	let reservedSkillNames = new Set<string>();
+	let queuedSkillNames = new Set<string>();
 	let reservationsByToolCall = new Map<string, Set<string>>();
 	let reconciledSessionId: string | undefined;
 	let reconciledLeafId: string | null | undefined;
@@ -70,14 +71,29 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		return true;
 	}
 
+	/**
+	 * An API delivery owns its reservation until its skill message persists or
+	 * the session is replaced. Turn, run, compaction, and tree resets keep it:
+	 * the message can still be waiting in Pi's pending queue at those points.
+	 */
+	function reserveQueued(name: string): boolean {
+		if (!reserve(name)) return false;
+		queuedSkillNames.add(name);
+		return true;
+	}
+
+	function isQueued(name: string): boolean {
+		return queuedSkillNames.has(name);
+	}
+
 	function releaseSkills(names: Iterable<string>): void {
 		for (const name of names) reservedSkillNames.delete(name);
 	}
 
+	/** Release transient tool-result reservations; API deliveries keep theirs (see reserveQueued). */
 	function releaseAll(): void {
-		for (const names of reservationsByToolCall.values()) releaseSkills(names);
 		reservationsByToolCall = new Map();
-		reservedSkillNames = new Set();
+		reservedSkillNames = new Set(queuedSkillNames);
 	}
 
 	function releaseToolCall(toolCallId: string): void {
@@ -97,6 +113,7 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	}
 
 	function clear(): void {
+		queuedSkillNames = new Set();
 		releaseAll();
 		injectedSkillNames = new Set();
 		activeSkill = undefined;
@@ -169,6 +186,10 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		}
 
 		injectedSkillNames = next;
+		for (const name of next) {
+			if (!queuedSkillNames.delete(name)) continue;
+			reservedSkillNames.delete(name);
+		}
 		reconciledSessionId = sessionId;
 		reconciledLeafId = leafId;
 		reconciledSkills = catalog.skills;
@@ -177,6 +198,8 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	return {
 		hasKnown,
 		reserve,
+		reserveQueued,
+		isQueued,
 		releaseSkills,
 		releaseAll,
 		releaseToolCall,
