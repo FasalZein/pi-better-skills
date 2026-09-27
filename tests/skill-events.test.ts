@@ -51,6 +51,7 @@ function fakePi(root: string, events = createEventBus()) {
 		api, events, sent, sessionManager,
 		getProvider: () => providerFactory!({ getSuggestions: async () => null, applyCompletion: () => ({ lines: [], cursorLine: 0, cursorCol: 0 }) }),
 		start: async () => { for (const handler of handlers.get("session_start") ?? []) await handler({}, ctx); },
+		turnEnd: async () => { for (const handler of handlers.get("turn_end") ?? []) await handler({}, ctx); },
 		request: (operation: string, fields: object = {}): SkillApiReply | undefined => {
 			let reply: SkillApiReply | undefined;
 			events.emit(SKILL_API_CHANNEL, { version: 1, operation, ...fields, reply: (value: SkillApiReply) => { reply = value; } });
@@ -97,6 +98,31 @@ test("delivery uses inline blocks, references, and persisted session residency",
 	}
 });
 
+test("a queued skill stays reserved after turn_end until Pi persists the steer message", async () => {
+	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-pending-")));
+	try {
+		const path = join(root, ".pi/skills/child/SKILL.md");
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, CHILD);
+		const pi = fakePi(root);
+		extension(pi.api as never);
+		await pi.start();
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "delivered" }],
+		});
+		await pi.turnEnd();
+		// Another steer message may arrive first, so the skill remains queued
+		// while the real SessionManager still has no persisted skill message.
+		expect(pi.sessionManager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
+		expect(pi.request("deliver", { names: ["child"] })).toEqual({
+			version: 1, operation: "deliver", outcomes: [{ name: "child", status: "already-resident" }],
+		});
+		expect(pi.sent).toHaveLength(1);
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
 test("API suggestions rank exactly like the main editor provider", async () => {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pbs-suggest-")));
 	try {
@@ -113,6 +139,10 @@ test("API suggestions rank exactly like the main editor provider", async () => {
 		const result = pi.request("suggest", { query: "skill:al" });
 		expect(result).toEqual({ version: 1, operation: "suggest", items: main?.items });
 		expect((result as { items: Array<{ value: string }> }).items.map((item) => item.value)).toContain("skill:alpha");
+		const all = await provider.getSuggestions(["use /"], 0, "use /".length, { signal: new AbortController().signal });
+		const empty = pi.request("suggest", { query: "" });
+		expect(empty).toEqual({ version: 1, operation: "suggest", items: all?.items });
+		expect((empty as { items: Array<{ value: string }> }).items.length).toBeGreaterThan(3);
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

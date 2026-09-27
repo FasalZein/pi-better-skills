@@ -375,7 +375,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 		}
 		if (direct.length) {
 			const batch = commitRefExpansion(direct, delivery.refDeps(ctx.cwd), staged);
-			const accepted = batch.filter((skill) => residency.reserve(skill.name));
+			const accepted = batch.filter((skill) => residency.reserveQueued(skill.name));
 			if (accepted.length) {
 				// During a tool call, Pi queues steer messages after the tool result.
 				// One batch keeps parent and references in the same continuation.
@@ -560,7 +560,7 @@ export default function skillRelativePaths(pi: ExtensionAPI) {
 	pi.on("turn_end", async (_event, ctx) => {
 		if (!sessionInitialized) return;
 		residency.reconcile(ctx);
-		residency.releaseAll();
+		residency.releaseTurn();
 		firstRead.settle();
 	});
 

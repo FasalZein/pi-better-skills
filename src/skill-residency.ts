@@ -54,6 +54,7 @@ function residencyMessage(message: SessionContextMessage): ResidencyMessage | un
 export function createSkillResidency(catalog: SkillCatalog) {
 	let injectedSkillNames = new Set<string>();
 	let reservedSkillNames = new Set<string>();
+	let queuedSkillNames = new Set<string>();
 	let reservationsByToolCall = new Map<string, Set<string>>();
 	let reconciledSessionId: string | undefined;
 	let reconciledLeafId: string | null | undefined;
@@ -70,14 +71,28 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		return true;
 	}
 
+	/** A steer message is persisted after turn_end, not alongside the tool result. */
+	function reserveQueued(name: string): boolean {
+		if (!reserve(name)) return false;
+		queuedSkillNames.add(name);
+		return true;
+	}
+
 	function releaseSkills(names: Iterable<string>): void {
 		for (const name of names) reservedSkillNames.delete(name);
 	}
 
+	function releaseTurn(): void {
+		// Pi polls steering after turn_end. Keep those reservations until the
+		// queued message persists or agent_end ends the run.
+		reservationsByToolCall = new Map();
+		reservedSkillNames = new Set(queuedSkillNames);
+	}
+
 	function releaseAll(): void {
-		for (const names of reservationsByToolCall.values()) releaseSkills(names);
 		reservationsByToolCall = new Map();
 		reservedSkillNames = new Set();
+		queuedSkillNames = new Set();
 	}
 
 	function releaseToolCall(toolCallId: string): void {
@@ -169,6 +184,10 @@ export function createSkillResidency(catalog: SkillCatalog) {
 		}
 
 		injectedSkillNames = next;
+		for (const name of next) {
+			if (!queuedSkillNames.delete(name)) continue;
+			reservedSkillNames.delete(name);
+		}
 		reconciledSessionId = sessionId;
 		reconciledLeafId = leafId;
 		reconciledSkills = catalog.skills;
@@ -177,7 +196,9 @@ export function createSkillResidency(catalog: SkillCatalog) {
 	return {
 		hasKnown,
 		reserve,
+		reserveQueued,
 		releaseSkills,
+		releaseTurn,
 		releaseAll,
 		releaseToolCall,
 		persistReservations,
